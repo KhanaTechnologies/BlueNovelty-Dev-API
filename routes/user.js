@@ -52,6 +52,9 @@ const addNotification = async (userId, title, message, type = 'info', link = '')
 // ===== Register (Public) =====
 router.post('/register', cpUpload, async (req, res) => {
   try {
+const files = req.files || {};
+    console.log(req.body)
+
     const {
       name, surname, email, password, gender, dateOfBirth,
       expertise, physicalAddress, idNumber, role
@@ -75,10 +78,11 @@ router.post('/register', cpUpload, async (req, res) => {
       physicalAddress,
       idNumber,
       role,
-      profileImage: req.files['profileImage']?.[0]?.path || '',
-      idDocument: req.files['idDocument']?.[0]?.path || '',
-      proofOfResidence: req.files['proofOfResidence']?.[0]?.path || '',
-      cvOrSupportingDocs: req.files['cvOrSupportingDocs']?.map(f => f.path) || []
+      profileImage: files['profileImage']?.[0]?.path || '',
+      idDocument: files['idDocument']?.[0]?.path || '',
+      proofOfResidence: files['proofOfResidence']?.[0]?.path || '',
+      cvOrSupportingDocs: files['cvOrSupportingDocs']?.map(f => f.path) || []
+
     });
 
     const savedUser = await user.save();
@@ -93,8 +97,8 @@ router.post('/register', cpUpload, async (req, res) => {
     );
 
     // Send verification email if needed
-    const token = jwt.sign({ userId: savedUser._id }, process.env.emailSecret, { expiresIn: '1h' });
-    await sendVerificationEmail(savedUser.email, token);
+    //const token = jwt.sign({ userId: savedUser._id }, process.env.emailSecret, { expiresIn: '1h' });
+    //await sendVerificationEmail(savedUser.email, token);
 
     res.status(201).json({ user: savedUser });
   } catch (error) {
