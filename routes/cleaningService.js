@@ -10,10 +10,40 @@ const moment = require('moment');
 // CREATE a new cleaning service
 router.post('/', validateUser, async (req, res) => {
   try {
-    console.log(req.body)
     const userId = req.userId;
+    const user = await User.findById(userId);
 
-    // Merge the userId into the request body explicitly
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    const { baseFee = 0, extras = [] } = req.body;
+
+    // Ensure extras is an array
+    const validExtras = Array.isArray(extras) ? extras : [];
+
+    // Calculate total extra fees
+    const extrasTotal = validExtras.reduce((sum, item) => {
+      return sum + (item.fee || 0);
+    }, 0);
+
+    const totalFee = baseFee + extrasTotal;
+
+    console.log(`User balance: ${user.balance}`);
+    console.log(`Base fee: ${baseFee}`);
+    console.log(`Extras total: ${extrasTotal}`);
+    console.log(`Total service fee: ${totalFee}`);
+
+    // Check if user can afford the total fee
+    if (user.balance < totalFee) {
+      return res.status(400).json({
+        message: 'Insufficient funds to request this service',
+        required: totalFee,
+        currentBalance: user.balance
+      });
+    }
+
+    // Proceed with service creation
     const newService = new CleaningService({
       ...req.body,
       requestingUserID: userId
@@ -21,11 +51,15 @@ router.post('/', validateUser, async (req, res) => {
 
     const savedService = await newService.save();
     console.log(savedService);
+
     res.status(201).json(savedService);
   } catch (err) {
+    console.error('Failed to create service:', err);
     res.status(400).json({ message: 'Failed to create service', error: err.message });
   }
 });
+
+
 
 
 // GET all cleaning services
