@@ -34,6 +34,7 @@ router.get('/', validateUser, async (req, res) => {
 
     const services = await CleaningService.find()
       .populate('team.cleaner', 'name email')
+      .populate('requestingUserID cleanerID')
       .populate('checklist.completedBy', 'name email')
       .populate('lastMessage')
       .populate('unreadCounts.user', 'name email');
@@ -48,6 +49,7 @@ router.get('/pending', validateUser, async (req, res) => {
   try {
     const services = await CleaningService.find({ serviceStatus: 'pending' })
       .populate('team.cleaner', 'name email')
+      .populate('requestingUserID cleanerID')
       .populate('checklist.completedBy', 'name email')
       .populate('lastMessage')
       .populate('unreadCounts.user', 'name email');
@@ -71,6 +73,7 @@ router.get('/assigned', validateUser, async (req, res) => {
       serviceStatus: 'assigned'            // Only assigned services
     })
       .populate('team.cleaner', 'name email')
+      .populate('requestingUserID cleanerID')
       .populate('checklist.completedBy', 'name email')
       .populate('lastMessage')
       .populate('unreadCounts.user', 'name email');
