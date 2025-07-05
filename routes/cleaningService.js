@@ -43,6 +43,10 @@ router.post('/', validateUser, async (req, res) => {
       });
     }
 
+    // Deduct the total fee from user's balance
+    user.balance -= totalFee;
+    await user.save();
+
     // Proceed with service creation
     const newService = new CleaningService({
       ...req.body,
@@ -58,6 +62,7 @@ router.post('/', validateUser, async (req, res) => {
     res.status(400).json({ message: 'Failed to create service', error: err.message });
   }
 });
+
 
 
 
