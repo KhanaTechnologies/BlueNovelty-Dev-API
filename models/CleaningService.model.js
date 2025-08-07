@@ -14,7 +14,8 @@ const cleaningServiceSchema = new mongoose.Schema({
       'standard', 
       'deep-cleaning', 
       'move-in/move-out', 
-      'post-construction', 
+      'post-construction',
+      'commercial',
       'office',
       'carpet',
       'window'
@@ -183,21 +184,46 @@ const cleaningServiceSchema = new mongoose.Schema({
     }
   },
 
+    // NEW: Booking Frequency
+  bookingFrequency: {
+  type: String,
+  enum: ['once-off', 'weekly', 'bi-weekly', 'monthly'],
+  default: 'once-off',
+  required: true
+},
+
+
+  // NEW: Rebooking Status
+  hasBeenRebooked: {
+    type: Boolean,
+    default: false
+  },
+
   //NEW : Chat stuff
  requestedDates: [{
   date: {
-    type: String, // or Date if you prefer
+    type: String, // can change to Date type if validated
     required: true
   },
-  startTime: {
-    type: String,
-    required: true
-  },
-  endTime: {
+  timeOfArrival: {
     type: String,
     required: true
   }
 }],
+
+  // New fields
+isRecurring: {
+  type: Boolean,
+  default: false
+},
+
+discountAmount: {
+  type: Number,
+  default: 0,
+  min: 0,
+  max: 100
+},
+
 
   chatEnabled: {
     type: Boolean,
@@ -232,12 +258,18 @@ const cleaningServiceSchema = new mongoose.Schema({
 
 // Calculate duration for each service date
 cleaningServiceSchema.virtual('requestedDates.duration').get(function() {
+  if (!Array.isArray(this.requestedDates)) return [];
+
   return this.requestedDates.map(date => {
+    if (!date?.startTime || !date?.endTime) return null;
+
     const [startH, startM] = date.startTime.split(':').map(Number);
     const [endH, endM] = date.endTime.split(':').map(Number);
-    return (endH - startH) + (endM - startM)/60;
+
+    return (endH - startH) + (endM - startM) / 60;
   });
 });
+
 
 // Indexes for performance
 cleaningServiceSchema.index({ propertyID: 1 });
@@ -248,12 +280,28 @@ cleaningServiceSchema.index({ serviceStatus: 1 });
 
 // Auto-generate checklist from extras if checklist is empty
 cleaningServiceSchema.pre('save', function(next) {
-  // Calculate serviceFee
-  if (this.isModified('baseFee') || this.isModified('extras')) {
-    this.serviceFee = this.baseFee + this.extras.reduce((sum, extra) => sum + extra.fee, 0);
+  // Discount logic
+  const isRecurringBooking = this.bookingFrequency && this.bookingFrequency !== 'once-off';
+
+  this.isRecurring = isRecurringBooking; // Sync with flag
+
+  const base = this.baseFee || 0;
+  const extrasTotal = this.extras.reduce((sum, extra) => sum + (extra.fee || 0), 0);
+  const totalBeforeDiscount = base + extrasTotal;
+
+  // Apply discount
+  if (isRecurringBooking) {
+    this.discountAmount = totalBeforeDiscount * 0.1; // 10%
+  } else {
+    this.discountAmount = 0;
   }
 
-  // Generate checklist if empty
+  const totalAfterDiscount = totalBeforeDiscount - this.discountAmount;
+
+  // Set serviceFee
+  this.serviceFee = totalAfterDiscount;
+
+  // Auto-generate checklist if empty
   if (this.isModified('extras') && (!this.checklist || this.checklist.length === 0)) {
     this.checklist = this.extras.map(extra => ({
       task: extra.name,
@@ -262,14 +310,11 @@ cleaningServiceSchema.pre('save', function(next) {
     }));
   }
 
-  // Initialize payments if empty
-  if ((!this.payments || this.payments.length === 0) && this.baseFee != null) {
-    const extrasTotal = this.extras.reduce((sum, extra) => sum + (extra.fee || 0), 0);
-    const totalAmount = this.baseFee + extrasTotal;
-
+  // Initialize payments if not yet set
+  if ((!this.payments || this.payments.length === 0) && base != null) {
     this.payments = [{
-      amount: totalAmount,
-      method: 'cash', // or dynamic default
+      amount: totalAfterDiscount,
+      method: 'cash', // default
       transactionId: `auto-${Date.now()}`,
       status: 'pending',
       paymentDate: new Date()
@@ -278,6 +323,7 @@ cleaningServiceSchema.pre('save', function(next) {
 
   next();
 });
+
 
 
 // Virtual: Total Amount Paid
