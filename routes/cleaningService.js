@@ -12,29 +12,27 @@ router.post('/', validateUser, async (req, res) => {
   try {
     const userId = req.userId;
     const user = await User.findById(userId);
-
+    console.log(req.body);
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
     }
 
-    const { baseFee = 0, extras = [] } = req.body;
+    const { baseFee = 0, extras = [], bookingFrequency = 'once-off' } = req.body;
 
-    // Ensure extras is an array
     const validExtras = Array.isArray(extras) ? extras : [];
+    const extrasTotal = validExtras.reduce((sum, item) => sum + (item.fee || 0), 0);
 
-    // Calculate total extra fees
-    const extrasTotal = validExtras.reduce((sum, item) => {
-      return sum + (item.fee || 0);
-    }, 0);
+    let totalFee = baseFee + extrasTotal;
 
-    const totalFee = baseFee + extrasTotal;
+    // Apply 10% discount for recurring bookings
+    const isRecurring = bookingFrequency !== 'once-off';
+    if (isRecurring) {
+      totalFee = totalFee * 0.9; // 10% discount
+    }
 
     console.log(`User balance: ${user.balance}`);
-    console.log(`Base fee: ${baseFee}`);
-    console.log(`Extras total: ${extrasTotal}`);
-    console.log(`Total service fee: ${totalFee}`);
+    console.log(`Total fee (after discount if any): ${totalFee}`);
 
-    // Check if user can afford the total fee
     if (user.balance < totalFee) {
       return res.status(400).json({
         message: 'Insufficient funds to request this service',
@@ -43,25 +41,26 @@ router.post('/', validateUser, async (req, res) => {
       });
     }
 
-    // Deduct the total fee from user's balance
     user.balance -= totalFee;
     await user.save();
 
-    // Proceed with service creation
     const newService = new CleaningService({
       ...req.body,
-      requestingUserID: userId
+      requestingUserID: userId,
+      baseFee,
+      serviceFee: totalFee, // Save the final fee to DB
+      isRecurring: isRecurring
     });
 
     const savedService = await newService.save();
-    console.log(savedService);
-
     res.status(201).json(savedService);
+
   } catch (err) {
     console.error('Failed to create service:', err);
     res.status(400).json({ message: 'Failed to create service', error: err.message });
   }
 });
+
 
 
 
@@ -124,53 +123,55 @@ router.get('/assigned', validateUser, async (req, res) => {
 });
 
 
-router.get('/streak', validateUser, async (req, res) => {
-  
-  const cleanerId = req.userId;  // fixed here
+// 💡 Make this function available to other files
+async function handleStreakLogic(userId) {
+  if (!mongoose.isValidObjectId(userId)) {
+    throw new Error('Invalid ID');
+  }
 
-  console.log(cleanerId);
-   if (!mongoose.isValidObjectId(cleanerId))
-     return res.status(400).json({ message: 'Invalid ID' });
+  const startOfWeek = moment().startOf('week').toDate();
+  const endOfWeek = moment().endOf('week').toDate();
 
-  try {
-    const startOfWeek = moment().startOf('week').toDate();
-    const endOfWeek = moment().endOf('week').toDate();
+  const services = await CleaningService.find({
+    cleanerID: userId,
+    serviceStatus: 'completed',
+    updatedAt: { $gte: startOfWeek, $lte: endOfWeek },
+    'rating.score': { $exists: true }
+  }).sort({ updatedAt: 1 });
 
-    const services = await CleaningService.find({
-      cleanerID: cleanerId,  // fixed here (was userId)
-      serviceStatus: 'completed',
-      updatedAt: { $gte: startOfWeek, $lte: endOfWeek },
-      'rating.score': { $exists: true }
-    }).sort({ updatedAt: 1 });
+  if (!services.length) {
+    await User.findByIdAndUpdate(userId, { hasAStreak: false });
+    return { streak: 'no', message: 'No completed services found in this period.', streakCount: 0 };
+  }
 
-    if (!services.length) {
-      await User.findByIdAndUpdate(cleanerId, { hasAStreak: false });
-      return res.json({ streak: 'no', message: 'No completed services found in this period.' });
-    }
+  let streakCount = 0;
+  let hasStreak = false;
 
-    let streakCount = 0;
-    let hasStreak = false;
-
-    for (const service of services) {
-      if (service.rating.score > 3) {
-        streakCount++;
-        if (streakCount >= 5) {
-          hasStreak = true;
-          break;
-        }
-      } else {
-        streakCount = 0;
+  for (const service of services) {
+    if (service.rating.score > 3) {
+      streakCount++;
+      if (streakCount >= 5) {
+        hasStreak = true;
+        break;
       }
+    } else {
+      streakCount = 0;
     }
+  }
 
-    await User.findByIdAndUpdate(cleanerId, { hasAStreak: hasStreak });
+  await User.findByIdAndUpdate(userId, { hasAStreak: hasStreak });
 
-    res.json({ streak: hasStreak ? 'yes' : 'no', streakCount });
+  return { streak: hasStreak ? 'yes' : 'no', streakCount };
+}
+
+router.get('/streak', validateUser, async (req, res) => {
+  try {
+    const result = await handleStreakLogic(req.userId);
+    res.json(result);
   } catch (err) {
     res.status(500).json({ message: 'Failed to get streak', error: err.message });
   }
 });
-
 
 // GET a single cleaning service by ID
 router.get('/:id', validateUser, async (req, res) => {
@@ -392,4 +393,4 @@ router.delete('/:id', validateUser, async (req, res) => {
 
 
 
-module.exports = router;
+module.exports = { router, handleStreakLogic };
