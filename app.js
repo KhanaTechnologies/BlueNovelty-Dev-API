@@ -32,7 +32,7 @@ var usersRoutes = require('./routes/user');
 var propertyRoutes = require('./routes/properties');
 var messageRoutes = require('./routes/messages');
 var reviewRoutes= require('./routes/reviews');
-var cleaningServiceRoutes = require('./routes/cleaningService');
+var { router: cleaningServiceRouter } = require('./routes/cleaningService');
 //Old routers
 var customerRoutes = require('./routes/customer');
 var clientRoutes = require('./routes/client');
@@ -81,7 +81,8 @@ app.options('*',cors());
  app.use(`${api}/reviews`, reviewRoutes);
  app.use(`${api}/messages`, messageRoutes);
  app.use(`${api}/properties`, propertyRoutes);
- app.use(`${api}/cleaningService`,cleaningServiceRoutes);
+ app.use(`${api}/cleaningService`, cleaningServiceRouter);
+
 
 
  app.use(`${api}/wishlists`, wishListRouter);
