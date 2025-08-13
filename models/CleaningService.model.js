@@ -16,8 +16,6 @@ const cleaningServiceSchema = new mongoose.Schema({
       'move-in/move-out', 
       'post-construction',
       'commercial',
-      'post-construction',
-      'commercial',
       'office',
       'carpet',
       'window'
@@ -289,28 +287,6 @@ cleaningServiceSchema.index({ serviceStatus: 1 });
 
 // Auto-generate checklist from extras if checklist is empty
 cleaningServiceSchema.pre('save', function(next) {
-  // Discount logic
-  const isRecurringBooking = this.bookingFrequency && this.bookingFrequency !== 'once-off';
-
-  this.isRecurring = isRecurringBooking; // Sync with flag
-
-  const base = this.baseFee || 0;
-  const extrasTotal = this.extras.reduce((sum, extra) => sum + (extra.fee || 0), 0);
-  const totalBeforeDiscount = base + extrasTotal;
-
-  // Apply discount
-  if (isRecurringBooking) {
-    this.discountAmount = totalBeforeDiscount * 0.1; // 10%
-  } else {
-    this.discountAmount = 0;
-  }
-
-  const totalAfterDiscount = totalBeforeDiscount - this.discountAmount;
-
-  // Set serviceFee
-  this.serviceFee = totalAfterDiscount;
-
-  // Auto-generate checklist if empty
   // Discount logic
   const isRecurringBooking = this.bookingFrequency && this.bookingFrequency !== 'once-off';
 

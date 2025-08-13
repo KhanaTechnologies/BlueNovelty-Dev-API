@@ -495,76 +495,29 @@ router.post('/:id/book-again', validateUser, async (req, res) => {
   }
 });
 
-// ACCEPT REBOOKING - Cleaner accepts a rebooked service
-router.put('/:id/accept-rebooking', validateUser, async (req, res) => {
+
+
+// DELETE a cleaning service
+router.delete('/:id', validateUser, async (req, res) => {
+  if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ message: 'Invalid ID' });
+
   try {
-    const serviceId = req.params.id;
-    const cleanerId = req.userId;
+    const deleted = await CleaningService.findByIdAndDelete(req.params.id);
+    if (!deleted) return res.status(404).json({ message: 'Service not found' });
 
-    // Validate service ID
-    if (!mongoose.isValidObjectId(serviceId)) {
-      return res.status(400).json({ message: 'Invalid service ID' });
-    }
-
-    // Find the service
-    const service = await CleaningService.findById(serviceId)
-      .populate('requestingUserID');
-
-    if (!service) {
-      return res.status(404).json({ message: 'Service not found' });
-    }
-
-    // Verify this is a rebooked service
-    if (!service.hasBeenRebooked) {
-      return res.status(400).json({ message: 'This is not a rebooked service' });
-    }
-
-    // Verify the user is the assigned cleaner
-    if (service.cleanerID.toString() !== cleanerId) {
-      return res.status(403).json({ message: 'Only the assigned cleaner can accept this rebooking' });
-    }
-
-    // Update service status
-    service.cleanerAcceptedRebooking = true;
-    service.serviceStatus = 'assigned';
-    const updatedService = await service.save();
-
-    // Decrement requester's active service counter
-    await User.findByIdAndUpdate(
-      service.requestingUserID._id,
-      { $inc: { numberOfActiveServiceRequests: -1 } }
-    );
-
-    // Notify the requester
-    const requesterNotification = {
-      title: 'Rebooking Accepted',
-      message: `Your cleaner has accepted your repeat booking request.`,
-      type: 'success',
-      link: `/services/${service._id}`
-    };
-
-    await User.findByIdAndUpdate(
-      service.requestingUserID._id,
-      { $push: { notifications: requesterNotification } }
-    );
-
-    res.status(200).json(updatedService);
-
+    res.status(200).json({ message: 'Service deleted successfully' });
   } catch (err) {
-    console.error('Failed to accept rebooking:', err);
-    res.status(400).json({ message: 'Failed to accept rebooking', error: err.message });
+    res.status(500).json({ message: 'Failed to delete service', error: err.message });
   }
 });
 
-
-// ACCEPT REBOOKING - Cleaner accepts a rebooked service
+// accept REBOOKING RESPONSE
 router.put('/:id/accept-rebooking', validateUser, async (req, res) => {
   try {
     const { accepted } = req.body;
     const serviceId = req.params.id;
     const cleanerId = req.userId;
 
-    // Validate input
     if (typeof accepted !== 'boolean') {
       return res.status(400).json({ message: 'Accepted status must be boolean' });
     }
@@ -573,7 +526,6 @@ router.put('/:id/accept-rebooking', validateUser, async (req, res) => {
       return res.status(400).json({ message: 'Invalid service ID' });
     }
 
-    // Find the service
     const service = await CleaningService.findById(serviceId)
       .populate('requestingUserID')
       .populate('cleanerID');
@@ -582,7 +534,6 @@ router.put('/:id/accept-rebooking', validateUser, async (req, res) => {
       return res.status(404).json({ message: 'Service not found' });
     }
 
-    // Verify permissions
     if (service.cleanerID._id.toString() !== cleanerId) {
       return res.status(403).json({ message: 'Only the assigned cleaner can respond' });
     }
@@ -591,10 +542,9 @@ router.put('/:id/accept-rebooking', validateUser, async (req, res) => {
       return res.status(400).json({ message: 'This is not a rebooked service' });
     }
 
-    // Prepare update
     const update = {
       CleanerhasAcceptedRebooking: accepted ? 'Yes' : 'No',
-      ...(accepted && { serviceStatus: 'assigned' }) // Only update status if accepted
+      ...(accepted && { serviceStatus: 'assigned' })
     };
 
     const updatedService = await CleaningService.findByIdAndUpdate(
@@ -603,12 +553,11 @@ router.put('/:id/accept-rebooking', validateUser, async (req, res) => {
       { new: true }
     );
 
-    // Handle notifications
     const notification = {
       title: accepted ? 'Rebooking Accepted' : 'Rebooking Declined',
       message: accepted 
         ? `Your cleaner has accepted your repeat booking request.` 
-        : `Your cleaner has declined your repeat booking request.`,
+        : `Your cleaner has declined your repeat booking request. This service can no longer be rebooked.`,
       type: accepted ? 'success' : 'warning',
       link: `/services/${serviceId}`
     };
@@ -618,7 +567,6 @@ router.put('/:id/accept-rebooking', validateUser, async (req, res) => {
       { $push: { notifications: notification } }
     );
 
-    // If declined, refund the user
     if (!accepted) {
       await User.findByIdAndUpdate(
         service.requestingUserID._id,
@@ -639,23 +587,45 @@ router.put('/:id/accept-rebooking', validateUser, async (req, res) => {
   }
 });
 
-
-
-// DELETE a cleaning service
-router.delete('/:id', validateUser, async (req, res) => {
-  if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ message: 'Invalid ID' });
-
+// MARK SERVICES AS EXPIRED
+router.put('/expire-services', validateUser, async (req, res) => {
   try {
-    const deleted = await CleaningService.findByIdAndDelete(req.params.id);
-    if (!deleted) return res.status(404).json({ message: 'Service not found' });
+    const { serviceIds } = req.body;
 
-    res.status(200).json({ message: 'Service deleted successfully' });
+    if (!Array.isArray(serviceIds) || serviceIds.length === 0) {
+      return res.status(400).json({ message: 'Invalid service IDs provided' });
+    }
+
+    const invalidIds = serviceIds.filter(id => !mongoose.isValidObjectId(id));
+    if (invalidIds.length > 0) {
+      return res.status(400).json({ 
+        message: 'Invalid service IDs detected',
+        invalidIds
+      });
+    }
+
+    const result = await CleaningService.updateMany(
+      {
+        _id: { $in: serviceIds },
+        serviceStatus: { $nin: ['completed', 'expired'] }
+      },
+      {
+        $set: { 
+          serviceStatus: 'expired'
+        }
+      }
+    );
+
+    res.status(200).json({
+      message: 'Services expired successfully',
+      matchedCount: result.matchedCount,
+      modifiedCount: result.modifiedCount
+    });
+
   } catch (err) {
-    res.status(500).json({ message: 'Failed to delete service', error: err.message });
+    console.error('Failed to expire services:', err);
+    res.status(500).json({ message: 'Failed to expire services', error: err.message });
   }
 });
 
-
-
-
-module.exports = router;
+module.exports = { router, handleStreakLogic };
