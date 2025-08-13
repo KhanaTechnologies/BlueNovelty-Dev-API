@@ -29,6 +29,13 @@ router.post('/', validateUser, async (req, res) => {
     if (isRecurring) {
       totalFee = totalFee * 0.9; // 10% discount
     }
+    let totalFee = baseFee + extrasTotal;
+
+    // Apply 10% discount for recurring bookings
+    const isRecurring = bookingFrequency !== 'once-off';
+    if (isRecurring) {
+      totalFee = totalFee * 0.9; // 10% discount
+    }
 
     console.log(`User balance: ${user.balance}`);
     console.log(`Total fee (after discount if any): ${totalFee}`);
@@ -47,6 +54,10 @@ router.post('/', validateUser, async (req, res) => {
 
     const newService = new CleaningService({
       ...req.body,
+      requestingUserID: userId,
+      baseFee,
+      serviceFee: totalFee, // Save the final fee to DB
+      isRecurring: isRecurring
       requestingUserID: userId,
       baseFee,
       serviceFee: totalFee, // Save the final fee to DB
@@ -657,50 +668,5 @@ router.delete('/:id', validateUser, async (req, res) => {
 
 
 
-// MARK SERVICES AS EXPIRED
-router.put('/expire-services', validateUser, async (req, res) => {
-  try {
-    const { serviceIds } = req.body;
 
-    // Validate input
-    if (!Array.isArray(serviceIds) || serviceIds.length === 0) {
-      return res.status(400).json({ message: 'Invalid service IDs provided' });
-    }
-
-    // Validate each ID
-    const invalidIds = serviceIds.filter(id => !mongoose.isValidObjectId(id));
-    if (invalidIds.length > 0) {
-      return res.status(400).json({ 
-        message: 'Invalid service IDs detected',
-        invalidIds
-      });
-    }
-
-    // Update services atomically
-    const result = await CleaningService.updateMany(
-      {
-        _id: { $in: serviceIds },
-        serviceStatus: { $ne: 'completed' } // Only expire non-completed services
-      },
-      {
-        $set: { 
-          serviceStatus: 'expired',
-          // Refund logic could be added here if needed
-        }
-      }
-    );
-
-    res.status(200).json({
-      message: 'Services expired successfully',
-      matchedCount: result.matchedCount,
-      modifiedCount: result.modifiedCount
-    });
-
-  } catch (err) {
-    console.error('Failed to expire services:', err);
-    res.status(500).json({ message: 'Failed to expire services', error: err.message });
-  }
-});
-
-
-module.exports = { router, handleStreakLogic };
+module.exports = router;
