@@ -29,13 +29,6 @@ router.post('/', validateUser, async (req, res) => {
     if (isRecurring) {
       totalFee = totalFee * 0.9; // 10% discount
     }
-    let totalFee = baseFee + extrasTotal;
-
-    // Apply 10% discount for recurring bookings
-    const isRecurring = bookingFrequency !== 'once-off';
-    if (isRecurring) {
-      totalFee = totalFee * 0.9; // 10% discount
-    }
 
     console.log(`User balance: ${user.balance}`);
     console.log(`Total fee (after discount if any): ${totalFee}`);
@@ -54,10 +47,6 @@ router.post('/', validateUser, async (req, res) => {
 
     const newService = new CleaningService({
       ...req.body,
-      requestingUserID: userId,
-      baseFee,
-      serviceFee: totalFee, // Save the final fee to DB
-      isRecurring: isRecurring
       requestingUserID: userId,
       baseFee,
       serviceFee: totalFee, // Save the final fee to DB
