@@ -12,29 +12,27 @@ router.post('/', validateUser, async (req, res) => {
   try {
     const userId = req.userId;
     const user = await User.findById(userId);
-
+    console.log(req.body);
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
     }
 
-    const { baseFee = 0, extras = [] } = req.body;
+    const { baseFee = 0, extras = [], bookingFrequency = 'once-off' } = req.body;
 
-    // Ensure extras is an array
     const validExtras = Array.isArray(extras) ? extras : [];
+    const extrasTotal = validExtras.reduce((sum, item) => sum + (item.fee || 0), 0);
 
-    // Calculate total extra fees
-    const extrasTotal = validExtras.reduce((sum, item) => {
-      return sum + (item.fee || 0);
-    }, 0);
+    let totalFee = baseFee + extrasTotal;
 
-    const totalFee = baseFee + extrasTotal;
+    // Apply 10% discount for recurring bookings
+    const isRecurring = bookingFrequency !== 'once-off';
+    if (isRecurring) {
+      totalFee = totalFee * 0.9; // 10% discount
+    }
 
     console.log(`User balance: ${user.balance}`);
-    console.log(`Base fee: ${baseFee}`);
-    console.log(`Extras total: ${extrasTotal}`);
-    console.log(`Total service fee: ${totalFee}`);
+    console.log(`Total fee (after discount if any): ${totalFee}`);
 
-    // Check if user can afford the total fee
     if (user.balance < totalFee) {
       return res.status(400).json({
         message: 'Insufficient funds to request this service',
@@ -43,25 +41,31 @@ router.post('/', validateUser, async (req, res) => {
       });
     }
 
-    // Deduct the total fee from user's balance
     user.balance -= totalFee;
+    user.numberOfActiveServiceRequests += 1; // Increment here
     await user.save();
 
-    // Proceed with service creation
     const newService = new CleaningService({
       ...req.body,
-      requestingUserID: userId
+      requestingUserID: userId,
+      baseFee,
+      serviceFee: totalFee, // Save the final fee to DB
+      isRecurring: isRecurring
     });
 
     const savedService = await newService.save();
-    console.log(savedService);
-
     res.status(201).json(savedService);
+
   } catch (err) {
+        if (user) {
+      user.numberOfActiveServiceRequests -= 1;
+      await user.save().catch(console.error);
+    }
     console.error('Failed to create service:', err);
     res.status(400).json({ message: 'Failed to create service', error: err.message });
   }
 });
+
 
 
 
@@ -124,53 +128,55 @@ router.get('/assigned', validateUser, async (req, res) => {
 });
 
 
-router.get('/streak', validateUser, async (req, res) => {
-  
-  const cleanerId = req.userId;  // fixed here
+// 💡 Make this function available to other files
+async function handleStreakLogic(userId) {
+  if (!mongoose.isValidObjectId(userId)) {
+    throw new Error('Invalid ID');
+  }
 
-  console.log(cleanerId);
-   if (!mongoose.isValidObjectId(cleanerId))
-     return res.status(400).json({ message: 'Invalid ID' });
+  const startOfWeek = moment().startOf('week').toDate();
+  const endOfWeek = moment().endOf('week').toDate();
 
-  try {
-    const startOfWeek = moment().startOf('week').toDate();
-    const endOfWeek = moment().endOf('week').toDate();
+  const services = await CleaningService.find({
+    cleanerID: userId,
+    serviceStatus: 'completed',
+    updatedAt: { $gte: startOfWeek, $lte: endOfWeek },
+    'rating.score': { $exists: true }
+  }).sort({ updatedAt: 1 });
 
-    const services = await CleaningService.find({
-      cleanerID: cleanerId,  // fixed here (was userId)
-      serviceStatus: 'completed',
-      updatedAt: { $gte: startOfWeek, $lte: endOfWeek },
-      'rating.score': { $exists: true }
-    }).sort({ updatedAt: 1 });
+  if (!services.length) {
+    await User.findByIdAndUpdate(userId, { hasAStreak: false });
+    return { streak: 'no', message: 'No completed services found in this period.', streakCount: 0 };
+  }
 
-    if (!services.length) {
-      await User.findByIdAndUpdate(cleanerId, { hasAStreak: false });
-      return res.json({ streak: 'no', message: 'No completed services found in this period.' });
-    }
+  let streakCount = 0;
+  let hasStreak = false;
 
-    let streakCount = 0;
-    let hasStreak = false;
-
-    for (const service of services) {
-      if (service.rating.score > 3) {
-        streakCount++;
-        if (streakCount >= 5) {
-          hasStreak = true;
-          break;
-        }
-      } else {
-        streakCount = 0;
+  for (const service of services) {
+    if (service.rating.score > 3) {
+      streakCount++;
+      if (streakCount >= 5) {
+        hasStreak = true;
+        break;
       }
+    } else {
+      streakCount = 0;
     }
+  }
 
-    await User.findByIdAndUpdate(cleanerId, { hasAStreak: hasStreak });
+  await User.findByIdAndUpdate(userId, { hasAStreak: hasStreak });
 
-    res.json({ streak: hasStreak ? 'yes' : 'no', streakCount });
+  return { streak: hasStreak ? 'yes' : 'no', streakCount };
+}
+
+router.get('/streak', validateUser, async (req, res) => {
+  try {
+    const result = await handleStreakLogic(req.userId);
+    res.json(result);
   } catch (err) {
     res.status(500).json({ message: 'Failed to get streak', error: err.message });
   }
 });
-
 
 // GET a single cleaning service by ID
 router.get('/:id', validateUser, async (req, res) => {
@@ -243,6 +249,11 @@ router.put('/:id', validateUser, async (req, res) => {
       switch(updated.serviceStatus) {
         case 'assigned':
           if (updated.cleanerID) {
+            // Decrement active requests counter for the requester
+            await User.findByIdAndUpdate(
+              updated.requestingUserID._id,
+              { $inc: { numberOfActiveServiceRequests: -1 } }
+            );
             notification = {
               title: 'Service Assigned',
               message: `Your service "${serviceName}" has been assigned to a cleaner.`,
@@ -370,8 +381,263 @@ router.put('/:id', validateUser, async (req, res) => {
   }
 });
 
+// BOOK AGAIN - Create a new booking based on a previous service
+router.post('/:id/book-again', validateUser, async (req, res) => {
+  try {
+    const userId = req.userId;
+    const originalServiceId = req.params.id;
+
+    // Validate the original service ID
+    if (!mongoose.isValidObjectId(originalServiceId)) {
+      return res.status(400).json({ message: 'Invalid service ID' });
+    }
+
+    // Find the original service
+    const originalService = await CleaningService.findById(originalServiceId)
+      .populate('requestingUserID', 'balance')
+      .populate('cleanerID');
+
+    if (!originalService) {
+      return res.status(404).json({ message: 'Original service not found' });
+    }
+
+    // Verify the requesting user is the same as the original
+    if (originalService.requestingUserID._id.toString() !== userId) {
+      return res.status(403).json({ message: 'You can only book again your own services' });
+    }
+
+    // Verify the original service was completed
+    if (originalService.serviceStatus !== 'completed') {
+      return res.status(400).json({ 
+        message: 'You can only book again completed services',
+        currentStatus: originalService.serviceStatus
+      });
+    }
+
+    // Check user balance
+    const user = await User.findById(userId);
+    if (user.balance < originalService.serviceFee) {
+      return res.status(400).json({
+        message: 'Insufficient funds to request this service',
+        required: originalService.serviceFee,
+        currentBalance: user.balance
+      });
+    }
+
+    // Create new service based on original
+    const newServiceData = {
+      ...originalService.toObject(),
+      _id: undefined, // Let MongoDB create new ID
+      requestedDates: req.body.requestedDates, // New dates from request
+      serviceStatus: 'pending',
+      cleanerID: originalService.cleanerID, // Keep same cleaner
+      cleanerAcceptedRebooking: false, // Reset acceptance flag
+      hasBeenRebooked: true, // Mark as rebooked
+      reviewedByCleaner: false,
+      reviewedByRequestingUser: false,
+      rating: undefined,
+      checklist: originalService.checklist.map(item => ({
+        ...item.toObject(),
+        _id: undefined,
+        completedCleaner: false,
+        completedRequester: false,
+        completedBy: undefined,
+        completedAt: undefined
+      })),
+      payments: [{
+        amount: originalService.serviceFee,
+        method: 'cash',
+        transactionId: `auto-${Date.now()}`,
+        status: 'pending'
+      }],
+      paidToCleaner: false,
+      createdAt: undefined,
+      updatedAt: undefined
+    };
+
+    // Deduct funds and increment active requests
+    user.balance -= originalService.serviceFee;
+    user.numberOfActiveServiceRequests += 1;
+    await user.save();
+
+    // Create the new service
+    const newService = new CleaningService(newServiceData);
+    const savedService = await newService.save();
+
+    // Notify the cleaner (if they were assigned previously)
+    if (originalService.cleanerID) {
+      const notification = {
+        title: 'Rebooking Request',
+        message: `A previous customer has requested you again for a service. Please accept or decline.`,
+        type: 'info',
+        link: `/services/${savedService._id}/accept-rebooking`
+      };
+
+      await User.findByIdAndUpdate(
+        originalService.cleanerID._id,
+        { $push: { notifications: notification } }
+      );
+    }
+
+    res.status(201).json(savedService);
+
+  } catch (err) {
+    console.error('Failed to book again:', err);
+    
+    // Rollback user balance and counter if error occurred
+    if (user) {
+      user.balance += originalService.serviceFee;
+      user.numberOfActiveServiceRequests -= 1;
+      await user.save().catch(console.error);
+    }
+    
+    res.status(400).json({ message: 'Failed to book again', error: err.message });
+  }
+});
+
+// ACCEPT REBOOKING - Cleaner accepts a rebooked service
+router.put('/:id/accept-rebooking', validateUser, async (req, res) => {
+  try {
+    const serviceId = req.params.id;
+    const cleanerId = req.userId;
+
+    // Validate service ID
+    if (!mongoose.isValidObjectId(serviceId)) {
+      return res.status(400).json({ message: 'Invalid service ID' });
+    }
+
+    // Find the service
+    const service = await CleaningService.findById(serviceId)
+      .populate('requestingUserID');
+
+    if (!service) {
+      return res.status(404).json({ message: 'Service not found' });
+    }
+
+    // Verify this is a rebooked service
+    if (!service.hasBeenRebooked) {
+      return res.status(400).json({ message: 'This is not a rebooked service' });
+    }
+
+    // Verify the user is the assigned cleaner
+    if (service.cleanerID.toString() !== cleanerId) {
+      return res.status(403).json({ message: 'Only the assigned cleaner can accept this rebooking' });
+    }
+
+    // Update service status
+    service.cleanerAcceptedRebooking = true;
+    service.serviceStatus = 'assigned';
+    const updatedService = await service.save();
+
+    // Decrement requester's active service counter
+    await User.findByIdAndUpdate(
+      service.requestingUserID._id,
+      { $inc: { numberOfActiveServiceRequests: -1 } }
+    );
+
+    // Notify the requester
+    const requesterNotification = {
+      title: 'Rebooking Accepted',
+      message: `Your cleaner has accepted your repeat booking request.`,
+      type: 'success',
+      link: `/services/${service._id}`
+    };
+
+    await User.findByIdAndUpdate(
+      service.requestingUserID._id,
+      { $push: { notifications: requesterNotification } }
+    );
+
+    res.status(200).json(updatedService);
+
+  } catch (err) {
+    console.error('Failed to accept rebooking:', err);
+    res.status(400).json({ message: 'Failed to accept rebooking', error: err.message });
+  }
+});
 
 
+// ACCEPT REBOOKING - Cleaner accepts a rebooked service
+router.put('/:id/accept-rebooking', validateUser, async (req, res) => {
+  try {
+    const { accepted } = req.body;
+    const serviceId = req.params.id;
+    const cleanerId = req.userId;
+
+    // Validate input
+    if (typeof accepted !== 'boolean') {
+      return res.status(400).json({ message: 'Accepted status must be boolean' });
+    }
+
+    if (!mongoose.isValidObjectId(serviceId)) {
+      return res.status(400).json({ message: 'Invalid service ID' });
+    }
+
+    // Find the service
+    const service = await CleaningService.findById(serviceId)
+      .populate('requestingUserID')
+      .populate('cleanerID');
+
+    if (!service) {
+      return res.status(404).json({ message: 'Service not found' });
+    }
+
+    // Verify permissions
+    if (service.cleanerID._id.toString() !== cleanerId) {
+      return res.status(403).json({ message: 'Only the assigned cleaner can respond' });
+    }
+
+    if (!service.hasBeenRebooked) {
+      return res.status(400).json({ message: 'This is not a rebooked service' });
+    }
+
+    // Prepare update
+    const update = {
+      CleanerhasAcceptedRebooking: accepted ? 'Yes' : 'No',
+      ...(accepted && { serviceStatus: 'assigned' }) // Only update status if accepted
+    };
+
+    const updatedService = await CleaningService.findByIdAndUpdate(
+      serviceId,
+      { $set: update },
+      { new: true }
+    );
+
+    // Handle notifications
+    const notification = {
+      title: accepted ? 'Rebooking Accepted' : 'Rebooking Declined',
+      message: accepted 
+        ? `Your cleaner has accepted your repeat booking request.` 
+        : `Your cleaner has declined your repeat booking request.`,
+      type: accepted ? 'success' : 'warning',
+      link: `/services/${serviceId}`
+    };
+
+    await User.findByIdAndUpdate(
+      service.requestingUserID._id,
+      { $push: { notifications: notification } }
+    );
+
+    // If declined, refund the user
+    if (!accepted) {
+      await User.findByIdAndUpdate(
+        service.requestingUserID._id,
+        { 
+          $inc: { 
+            balance: service.serviceFee,
+            numberOfActiveServiceRequests: -1
+          } 
+        }
+      );
+    }
+
+    res.status(200).json(updatedService);
+
+  } catch (err) {
+    console.error('Failed to process rebooking response:', err);
+    res.status(400).json({ message: 'Failed to process response', error: err.message });
+  }
+});
 
 
 
@@ -391,5 +657,50 @@ router.delete('/:id', validateUser, async (req, res) => {
 
 
 
+// MARK SERVICES AS EXPIRED
+router.put('/expire-services', validateUser, async (req, res) => {
+  try {
+    const { serviceIds } = req.body;
 
-module.exports = router;
+    // Validate input
+    if (!Array.isArray(serviceIds) || serviceIds.length === 0) {
+      return res.status(400).json({ message: 'Invalid service IDs provided' });
+    }
+
+    // Validate each ID
+    const invalidIds = serviceIds.filter(id => !mongoose.isValidObjectId(id));
+    if (invalidIds.length > 0) {
+      return res.status(400).json({ 
+        message: 'Invalid service IDs detected',
+        invalidIds
+      });
+    }
+
+    // Update services atomically
+    const result = await CleaningService.updateMany(
+      {
+        _id: { $in: serviceIds },
+        serviceStatus: { $ne: 'completed' } // Only expire non-completed services
+      },
+      {
+        $set: { 
+          serviceStatus: 'expired',
+          // Refund logic could be added here if needed
+        }
+      }
+    );
+
+    res.status(200).json({
+      message: 'Services expired successfully',
+      matchedCount: result.matchedCount,
+      modifiedCount: result.modifiedCount
+    });
+
+  } catch (err) {
+    console.error('Failed to expire services:', err);
+    res.status(500).json({ message: 'Failed to expire services', error: err.message });
+  }
+});
+
+
+module.exports = { router, handleStreakLogic };

@@ -22,6 +22,10 @@ const userSchema = new mongoose.Schema({
     validate: [validator.isEmail, 'Please provide a valid email'],
     maxlength: [100, 'Email cannot exceed 100 characters']
   },
+  numberOfActiveServiceRequests:{
+    type: Number,
+    default: 0,
+  },
   password: {
     type: String,
     required: [true, 'Please provide a password'],

@@ -10,6 +10,7 @@ const authJwt = require('../helpers/jwt');
 const { sendVerificationEmail } = require('../utils/email');
 const validateUser = require('../utils/validateUser');
 const router = express.Router();
+const { handleStreakLogic } = require('./cleaningService'); // 💡 import directly
 
 require('dotenv').config();
 
@@ -80,6 +81,7 @@ const addNotification = async (userId, title, message, type = 'info', link = '')
 };
 
 router.post('/register', cpUpload, async (req, res) => {
+  console.log(req.body)
   try {
     const { name, surname, email, password, gender, dateOfBirth,
       expertise, physicalAddress, idNumber, role } = req.body;
@@ -153,15 +155,24 @@ router.get('/', async (req, res) => {
 
 router.get('/me', validateUser, async (req, res) => {
   try {
+
+    // Call the function directly from the other router file
+    const streakInfo = await handleStreakLogic(req.userId);
+
     const user = await User.findById(req.userId).select('-password');
     if (!user) return res.status(404).json({ error: 'User not found' });
-    res.json(user);
+
+    res.json({ 
+      ...user.toObject(), 
+      streakInfo 
+    });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch user' });
   }
 });
 
 router.put('/:id', cpUpload, async (req, res) => {
+    console.log(req.body)
   try {
     const userId = req.params.id;
     const currentUser = req.userId;
@@ -172,15 +183,19 @@ router.put('/:id', cpUpload, async (req, res) => {
     if (fileUrls.idDocument) updateFields.idDocument = fileUrls.idDocument;
     if (fileUrls.proofOfResidence) updateFields.proofOfResidence = fileUrls.proofOfResidence;
     if (fileUrls.cvOrSupportingDocs) updateFields.cvOrSupportingDocs = fileUrls.cvOrSupportingDocs;
-
+    console.log("hit 1");
     if (updateFields.password) {
       updateFields.password = await bcrypt.hash(updateFields.password, 10);
       await addNotification(userId, 'Password Changed', 'Your password was successfully updated', 'security', '/security');
     }
+    
+      console.log(userId);
+      const updatedUser = await User.findByIdAndUpdate(userId, updateFields, { new: true });
+      console.log("hit 3");
+    
 
-    const updatedUser = await User.findByIdAndUpdate(userId, updateFields, { new: true }).select('-password');
     if (!updatedUser) return res.status(404).json({ error: 'User not found' });
-
+console.log("hit 2");
     if (userId === currentUser.toString()) {
       await addNotification(userId, 'Profile Updated', 'Your profile information was successfully updated', 'info', '/profile');
     } else {
@@ -232,5 +247,29 @@ router.patch('/notifications/mark-read', validateUser, async (req, res) => {
     res.status(500).json({ error: 'Failed to update notifications' });
   }
 });
+
+
+router.patch('/notifications/delete', validateUser, async (req, res) => {
+  console.log(req.body)
+  try {
+    console.log(req.body)
+    const { notificationIds } = req.body;
+
+    await User.updateOne(
+      { _id: req.userId },
+      {
+        $pull: {
+          notifications: { _id: { $in: notificationIds } }
+        }
+      }
+    );
+
+    res.json({ message: 'Notifications deleted successfully' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Failed to delete notifications' });
+  }
+});
+
 
 module.exports = router;
