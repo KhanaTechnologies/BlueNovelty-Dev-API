@@ -57,6 +57,8 @@ router.post('/', validateUser, async (req, res) => {
     res.status(201).json(savedService);
 
   } catch (err) {
+    const userId = req.userId;
+    const user = await User.findById(userId);
         if (user) {
       user.numberOfActiveServiceRequests -= 1;
       await user.save().catch(console.error);
@@ -514,6 +516,7 @@ router.delete('/:id', validateUser, async (req, res) => {
 // accept REBOOKING RESPONSE
 router.put('/:id/accept-rebooking', validateUser, async (req, res) => {
   try {
+    console.log(req.body)
     const { accepted } = req.body;
     const serviceId = req.params.id;
     const cleanerId = req.userId;

@@ -202,7 +202,7 @@ const cleaningServiceSchema = new mongoose.Schema({
   // NEW: Rebooking Status
   CleanerhasAcceptedRebooking: {
     type: String,
-    enum: ['Yes', 'No'],
+    enum: ['','Yes', 'No'],
     default: ''
   },
 
