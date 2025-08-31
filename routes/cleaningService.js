@@ -1,18 +1,16 @@
 const express = require('express');
 const router = express.Router();
 const mongoose = require('mongoose');
+const moment = require('moment');
 const User = require('../models/user');
 const CleaningService = require('./../models/CleaningService.model');
-const validateUser = require('../utils/validateUser'); // <- Add your middleware
-const moment = require('moment');
-
+const validateUser = require('../utils/validateUser');
 
 // CREATE a new cleaning service
 router.post('/', validateUser, async (req, res) => {
   try {
     const userId = req.userId;
     const user = await User.findById(userId);
-    console.log(req.body);
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
     }
@@ -29,9 +27,6 @@ router.post('/', validateUser, async (req, res) => {
     if (isRecurring) {
       totalFee = totalFee * 0.9; // 10% discount
     }
-
-    console.log(`User balance: ${user.balance}`);
-    console.log(`Total fee (after discount if any): ${totalFee}`);
 
     if (user.balance < totalFee) {
       return res.status(400).json({
@@ -58,25 +53,22 @@ router.post('/', validateUser, async (req, res) => {
 
   } catch (err) {
     const userId = req.userId;
-    const user = await User.findById(userId);
-        if (user) {
-      user.numberOfActiveServiceRequests -= 1;
-      await user.save().catch(console.error);
-    }
+    try {
+      const user = await User.findById(userId);
+      if (user) {
+        user.numberOfActiveServiceRequests = Math.max(0, (user.numberOfActiveServiceRequests || 0) - 1);
+        await user.save();
+      }
+    } catch (e) {}
+
     console.error('Failed to create service:', err);
     res.status(400).json({ message: 'Failed to create service', error: err.message });
   }
 });
 
-
-
-
-
-
 // GET all cleaning services
 router.get('/', validateUser, async (req, res) => {
   try {
-
     const services = await CleaningService.find()
       .populate('team.cleaner', 'name email')
       .populate('requestingUserID cleanerID')
@@ -105,17 +97,15 @@ router.get('/pending', validateUser, async (req, res) => {
   }
 });
 
-
 // GET all assigned cleaning services for the current user (as cleaner or requester)
 router.get('/assigned', validateUser, async (req, res) => {
   try {
-
     const services = await CleaningService.find({
       $or: [
-        { cleanerID : req.userId },       // Assigned as cleaner on the team
-        { requestingUserID: req.userId }      // The user who requested the service
+        { cleanerID : req.userId },
+        { requestingUserID: req.userId }
       ],
-      serviceStatus: 'assigned'            // Only assigned services
+      serviceStatus: 'assigned'
     })
       .populate('team.cleaner', 'name email')
       .populate('requestingUserID cleanerID')
@@ -129,6 +119,93 @@ router.get('/assigned', validateUser, async (req, res) => {
   }
 });
 
+// --- Arrival Code APIs ---
+
+// Generate (or regenerate) an arrival code — only the requesting user can do this
+router.post('/:id/generate-arrival-code', validateUser, async (req, res) => {
+  try {
+    const { ttlMinutes } = req.body || {};
+    const serviceId = req.params.id;
+
+    if (!mongoose.isValidObjectId(serviceId)) {
+      return res.status(400).json({ message: 'Invalid service ID' });
+    }
+
+    const service = await CleaningService.findById(serviceId).populate('requestingUserID cleanerID');
+    if (!service) return res.status(404).json({ message: 'Service not found' });
+
+    if (service.requestingUserID._id.toString() !== req.userId) {
+      return res.status(403).json({ message: 'Only the requesting user can generate the arrival code' });
+    }
+
+    // Optional: only allow generation when assigned
+    if (service.serviceStatus !== 'assigned') {
+      return res.status(400).json({ message: 'Arrival code can only be generated when the service is assigned' });
+    }
+
+    const minutes = 2; // fixed lifetime
+    const code = service.generateArrivalCode(minutes);
+    await service.save();
+
+    // TODO: send via SMS/email/push; returning for now
+    res.status(200).json({
+      message: 'Arrival code generated',
+      code,
+      expiresAt: service.arrivalVerification.expiresAt
+    });
+  } catch (err) {
+    console.error('Generate arrival code error:', err);
+    res.status(400).json({ message: 'Failed to generate arrival code', error: err.message });
+  }
+});
+
+// Cleaner verifies the arrival code on site
+router.post('/:id/verify-arrival', validateUser, async (req, res) => {
+  try {
+    const serviceId = req.params.id;
+    const { code } = req.body;
+
+    if (!mongoose.isValidObjectId(serviceId)) {
+      return res.status(400).json({ message: 'Invalid service ID' });
+    }
+    if (!code || typeof code !== 'string') {
+      return res.status(400).json({ message: 'Code is required' });
+    }
+
+    const service = await CleaningService.findById(serviceId);
+    if (!service) return res.status(404).json({ message: 'Service not found' });
+
+    if (!service.cleanerID || service.cleanerID.toString() !== req.userId) {
+      return res.status(403).json({ message: 'Only the assigned cleaner can verify arrival' });
+    }
+
+    const result = await service.verifyArrivalCode(code, req.userId);
+
+    try {
+      await User.findByIdAndUpdate(service.requestingUserID, {
+        $push: {
+          notifications: {
+            title: 'Cleaner Arrived',
+            message: 'Your cleaner has verified arrival using your code. The service is now in progress.',
+            type: 'info',
+            link: `/services/${service._id}`
+          }
+        }
+      });
+    } catch (_) {}
+
+    res.status(200).json({
+      message: result.alreadyVerified ? 'Already verified' : 'Arrival verified',
+      serviceStatus: service.serviceStatus,
+      verifiedAt: service.arrivalVerification?.verifiedAt
+    });
+  } catch (err) {
+    console.error('Verify arrival error:', err);
+    res.status(400).json({ message: 'Failed to verify arrival', error: err.message });
+  }
+});
+
+// --- End Arrival Code APIs ---
 
 // 💡 Make this function available to other files
 async function handleStreakLogic(userId) {
@@ -192,7 +269,6 @@ router.get('/:id', validateUser, async (req, res) => {
       .populate('lastMessage')
       .populate('unreadCounts.user', 'name email');
     if (!service) return res.status(404).json({ message: 'Service not found' });
-    console.log(service);
     res.status(200).json(service);
   } catch (err) {
     res.status(500).json({ message: 'Failed to get service', error: err.message });
@@ -205,14 +281,10 @@ router.put('/:id', validateUser, async (req, res) => {
   }
 
   try {
-    console.log('[REQ.BODY]', req.body);
-
     // Fetch current service before update with populated requestingUserID
     const existing = await CleaningService.findById(req.params.id)
       .populate('requestingUserID', 'name email notifications')
       .populate('cleanerID', 'name email notifications');
-    
-    console.log('[EXISTING SERVICE]', existing);
 
     if (!existing) {
       return res.status(404).json({ message: 'Service not found' });
@@ -224,16 +296,12 @@ router.put('/:id', validateUser, async (req, res) => {
       req.body,
       { new: true, runValidators: true }
     ).populate('requestingUserID cleanerID');
-    
-    console.log('[UPDATED SERVICE]', updated);
 
     // Check checklist items
     const checklist = updated.checklist || [];
     const allTasksCompleted = checklist.length > 0 && checklist.every(task =>
       task.completedCleaner === true && task.completedRequester === true
     );
-    console.log('[CHECKLIST]', checklist);
-    console.log('[ALL TASKS COMPLETED]', allTasksCompleted);
 
     // Check if service status just changed
     const statusJustChanged = existing.serviceStatus !== updated.serviceStatus;
@@ -241,7 +309,6 @@ router.put('/:id', validateUser, async (req, res) => {
       existing.serviceStatus !== 'completed' && 
       updated.serviceStatus === 'completed'
     );
-    console.log('[STATUS JUST COMPLETED]', statusJustCompleted);
 
     // Handle notifications for status changes
     if (statusJustChanged) {
@@ -251,7 +318,6 @@ router.put('/:id', validateUser, async (req, res) => {
       switch(updated.serviceStatus) {
         case 'assigned':
           if (updated.cleanerID) {
-            // Decrement active requests counter for the requester
             await User.findByIdAndUpdate(
               updated.requestingUserID._id,
               { $inc: { numberOfActiveServiceRequests: -1 } }
@@ -283,27 +349,22 @@ router.put('/:id', validateUser, async (req, res) => {
           break;
           
         case 'completed':
-          // Notification for requester
           const requesterNotification = {
             title: 'Service Completed',
             message: `Your service "${serviceName}" has been completed. Please review the work.`,
             type: 'success',
             link: `/services/${updated._id}`
           };
-          
-          // Notification for cleaner
           const cleanerNotification = {
             title: 'Job Completed',
             message: `You've completed the service "${serviceName}". Payment will be processed.`,
             type: 'success',
             link: `/services/${updated._id}`
           };
-          
           await User.findByIdAndUpdate(
             updated.requestingUserID._id,
             { $push: { notifications: requesterNotification } }
           );
-          
           if (updated.cleanerID) {
             await User.findByIdAndUpdate(
               updated.cleanerID._id,
@@ -319,10 +380,8 @@ router.put('/:id', validateUser, async (req, res) => {
             type: 'warning',
             link: `/services/${updated._id}`
           };
-          
           const recipients = [updated.requestingUserID._id];
           if (updated.cleanerID) recipients.push(updated.cleanerID._id);
-          
           await User.updateMany(
             { _id: { $in: recipients } },
             { $push: { notifications: cancelledNotification } }
@@ -332,30 +391,22 @@ router.put('/:id', validateUser, async (req, res) => {
     }
 
     const shouldPayCleaner = (allTasksCompleted || statusJustCompleted) && !updated.paidToCleaner;
-    console.log('[SHOULD PAY CLEANER]', shouldPayCleaner);
 
     if (shouldPayCleaner) {
-      // Filter unpaid completed payments
       const unpaidCompletedPayments = updated.payments.filter(p =>
         p.status !== 'completed' && !p.paidToCleaner
       );
-      console.log('[UNPAID COMPLETED PAYMENTS]', unpaidCompletedPayments);
-
       const amountToPay = unpaidCompletedPayments.reduce((sum, p) => sum + p.amount, 0);
-      console.log('[AMOUNT TO PAY]', amountToPay);
 
       if (amountToPay > 0) {
-        // Credit the cleaner's balance
         await User.findByIdAndUpdate(
           updated.cleanerID,
           { $inc: { balance: amountToPay } }
         );
-        console.log(`[CLEANER ${updated.cleanerID}] credited with ${amountToPay}`);
 
-        // Create payment notification for cleaner
         const paymentNotification = {
           title: 'Payment Received',
-          message: `You've received $${amountToPay.toFixed(2)} for completing "${updated.name}".`,
+          message: `You've received $${amountToPay.toFixed(2)} for completing "${updated.name || 'Cleaning Service'}".`,
           type: 'success',
           link: `/services/${updated._id}`
         };
@@ -365,14 +416,12 @@ router.put('/:id', validateUser, async (req, res) => {
           { $push: { notifications: paymentNotification } }
         );
 
-        // Mark payments as paid
         unpaidCompletedPayments.forEach(p => {
           p.paidToCleaner = true;
         });
 
         updated.paidToCleaner = true;
         await updated.save();
-        console.log('[UPDATED SERVICE AFTER PAYMENT]', updated);
       }
     }
 
@@ -385,17 +434,17 @@ router.put('/:id', validateUser, async (req, res) => {
 
 // BOOK AGAIN - Create a new booking based on a previous service
 router.post('/:id/book-again', validateUser, async (req, res) => {
+  let user = null;
+  let originalService = null;
   try {
     const userId = req.userId;
     const originalServiceId = req.params.id;
 
-    // Validate the original service ID
     if (!mongoose.isValidObjectId(originalServiceId)) {
       return res.status(400).json({ message: 'Invalid service ID' });
     }
 
-    // Find the original service
-    const originalService = await CleaningService.findById(originalServiceId)
+    originalService = await CleaningService.findById(originalServiceId)
       .populate('requestingUserID', 'balance')
       .populate('cleanerID');
 
@@ -403,12 +452,10 @@ router.post('/:id/book-again', validateUser, async (req, res) => {
       return res.status(404).json({ message: 'Original service not found' });
     }
 
-    // Verify the requesting user is the same as the original
     if (originalService.requestingUserID._id.toString() !== userId) {
       return res.status(403).json({ message: 'You can only book again your own services' });
     }
 
-    // Verify the original service was completed
     if (originalService.serviceStatus !== 'completed') {
       return res.status(400).json({ 
         message: 'You can only book again completed services',
@@ -416,8 +463,7 @@ router.post('/:id/book-again', validateUser, async (req, res) => {
       });
     }
 
-    // Check user balance
-    const user = await User.findById(userId);
+    user = await User.findById(userId);
     if (user.balance < originalService.serviceFee) {
       return res.status(400).json({
         message: 'Insufficient funds to request this service',
@@ -426,15 +472,14 @@ router.post('/:id/book-again', validateUser, async (req, res) => {
       });
     }
 
-    // Create new service based on original
     const newServiceData = {
       ...originalService.toObject(),
-      _id: undefined, // Let MongoDB create new ID
-      requestedDates: req.body.requestedDates, // New dates from request
+      _id: undefined,
+      requestedDates: req.body.requestedDates,
       serviceStatus: 'pending',
-      cleanerID: originalService.cleanerID, // Keep same cleaner
-      cleanerAcceptedRebooking: false, // Reset acceptance flag
-      hasBeenRebooked: true, // Mark as rebooked
+      cleanerID: originalService.cleanerID,
+      cleanerAcceptedRebooking: false,
+      hasBeenRebooked: true,
       reviewedByCleaner: false,
       reviewedByRequestingUser: false,
       rating: undefined,
@@ -454,19 +499,17 @@ router.post('/:id/book-again', validateUser, async (req, res) => {
       }],
       paidToCleaner: false,
       createdAt: undefined,
-      updatedAt: undefined
+      updatedAt: undefined,
+      arrivalVerification: undefined
     };
 
-    // Deduct funds and increment active requests
     user.balance -= originalService.serviceFee;
-    user.numberOfActiveServiceRequests += 1;
+    user.numberOfActiveServiceRequests = (user.numberOfActiveServiceRequests || 0) + 1;
     await user.save();
 
-    // Create the new service
     const newService = new CleaningService(newServiceData);
     const savedService = await newService.save();
 
-    // Notify the cleaner (if they were assigned previously)
     if (originalService.cleanerID) {
       const notification = {
         title: 'Rebooking Request',
@@ -485,19 +528,16 @@ router.post('/:id/book-again', validateUser, async (req, res) => {
 
   } catch (err) {
     console.error('Failed to book again:', err);
-    
-    // Rollback user balance and counter if error occurred
-    if (user) {
-      user.balance += originalService.serviceFee;
-      user.numberOfActiveServiceRequests -= 1;
-      await user.save().catch(console.error);
+    if (user && originalService) {
+      try {
+        user.balance += originalService.serviceFee;
+        user.numberOfActiveServiceRequests = Math.max(0, (user.numberOfActiveServiceRequests || 1) - 1);
+        await user.save();
+      } catch (e) {}
     }
-    
     res.status(400).json({ message: 'Failed to book again', error: err.message });
   }
 });
-
-
 
 // DELETE a cleaning service
 router.delete('/:id', validateUser, async (req, res) => {
@@ -516,7 +556,6 @@ router.delete('/:id', validateUser, async (req, res) => {
 // accept REBOOKING RESPONSE
 router.put('/:id/accept-rebooking', validateUser, async (req, res) => {
   try {
-    console.log(req.body)
     const { accepted } = req.body;
     const serviceId = req.params.id;
     const cleanerId = req.userId;

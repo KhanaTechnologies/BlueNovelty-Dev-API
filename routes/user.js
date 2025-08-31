@@ -172,41 +172,85 @@ router.get('/me', validateUser, async (req, res) => {
 });
 
 router.put('/:id', cpUpload, async (req, res) => {
-    console.log(req.body)
+  console.log(req.body)
   try {
     const userId = req.params.id;
     const currentUser = req.userId;
     const updateFields = { ...req.body };
     const fileUrls = await processUploads(req.files || {}, 'users');
 
-    if (fileUrls.profileImage) updateFields.profileImage = fileUrls.profileImage;
-    if (fileUrls.idDocument) updateFields.idDocument = fileUrls.idDocument;
-    if (fileUrls.proofOfResidence) updateFields.proofOfResidence = fileUrls.proofOfResidence;
-    if (fileUrls.cvOrSupportingDocs) updateFields.cvOrSupportingDocs = fileUrls.cvOrSupportingDocs;
+    if (fileUrls.profileImage) {
+      updateFields.profileImage = fileUrls.profileImage;
+      console.log('updateFields.profileImage :', updateFields.profileImage);
+    }
+
+    if (fileUrls.idDocument) {
+      // always a single string
+      updateFields.idDocument = fileUrls.idDocument;
+      console.log('updateFields.idDocument :', updateFields.idDocument);
+    }
+
+    if (fileUrls.proofOfResidence) {
+      updateFields.proofOfResidence = fileUrls.proofOfResidence;
+      console.log('updateFields.proofOfResidence :', updateFields.proofOfResidence);
+    }
+
+    if (fileUrls.cvOrSupportingDocs) {
+      // normalize so it’s always a flat array of strings (latest only)
+      if (Array.isArray(fileUrls.cvOrSupportingDocs)) {
+        updateFields.cvOrSupportingDocs = fileUrls.cvOrSupportingDocs.slice(-1); // keep only latest
+      } else {
+        updateFields.cvOrSupportingDocs = [fileUrls.cvOrSupportingDocs];
+      }
+      console.log('updateFields.cvOrSupportingDocs :', updateFields.cvOrSupportingDocs);
+    }
+
     console.log("hit 1");
+
     if (updateFields.password) {
       updateFields.password = await bcrypt.hash(updateFields.password, 10);
-      await addNotification(userId, 'Password Changed', 'Your password was successfully updated', 'security', '/security');
+      await addNotification(
+        userId,
+        'Password Changed',
+        'Your password was successfully updated',
+        'security',
+        '/security'
+      );
     }
-    
-      console.log(userId);
-      const updatedUser = await User.findByIdAndUpdate(userId, updateFields, { new: true });
-      console.log("hit 3");
-    
+
+    console.log(userId);
+    const updatedUser = await User.findByIdAndUpdate(userId, updateFields, { new: true });
+    console.log("hit 3");
 
     if (!updatedUser) return res.status(404).json({ error: 'User not found' });
-console.log("hit 2");
+
+    console.log("hit 2");
+
     if (userId === currentUser.toString()) {
-      await addNotification(userId, 'Profile Updated', 'Your profile information was successfully updated', 'info', '/profile');
+      await addNotification(
+        userId,
+        'Profile Updated',
+        'Your profile information was successfully updated',
+        'info',
+        '/profile'
+      );
     } else {
-      await addNotification(userId, 'Profile Updated by Admin', 'Your profile was updated by an administrator', 'warning', '/profile');
+      await addNotification(
+        userId,
+        'Profile Updated by Admin',
+        'Your profile was updated by an administrator',
+        'warning',
+        '/profile'
+      );
     }
 
     res.json(updatedUser);
   } catch (error) {
+    console.error("Update user error:", error);
     res.status(500).json({ error: error.message });
   }
 });
+
 
 router.delete('/:id', async (req, res) => {
   try {

@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const validator = require('validator');
+const crypto = require('crypto');
 
 const cleaningServiceSchema = new mongoose.Schema({
   propertyID: {
@@ -42,6 +43,7 @@ const cleaningServiceSchema = new mongoose.Schema({
     ref: 'User',
     validate: {
       validator: async function(value) {
+        if (!value) return true;
         const user = await mongoose.model('User').findById(value);
         return user && user.role === 'cleaner';
       },
@@ -53,7 +55,8 @@ const cleaningServiceSchema = new mongoose.Schema({
     ref: 'User',
     required: [true, 'Requesting user is required']
   },
-  // Add these new fields to track review status
+
+  // Reviews
   reviewedByCleaner: {
     type: Boolean,
     default: false
@@ -63,7 +66,7 @@ const cleaningServiceSchema = new mongoose.Schema({
     default: false
   },
 
-  // NEW: Payment Tracking
+  // Payments
   payments: [{
     amount: {
       type: Number,
@@ -88,10 +91,11 @@ const cleaningServiceSchema = new mongoose.Schema({
       type: Date,
       default: Date.now
     },
-    receiptUrl: String
+    receiptUrl: String,
+    paidToCleaner: { type: Boolean, default: false }
   }],
 
-  // NEW: Rating System
+  // Rating
   rating: {
     score: {
       type: Number,
@@ -104,6 +108,7 @@ const cleaningServiceSchema = new mongoose.Schema({
     },
     ratedAt: Date
   },
+
   baseFee: {
     type: Number,
     required: [true, 'Base service fee is required'],
@@ -116,7 +121,7 @@ const cleaningServiceSchema = new mongoose.Schema({
   },
   paidToCleaner: { type: Boolean, default: false },
 
-  // NEW: Equipment Requirements
+  // Equipment
   equipmentRequirements: [{
     name: {
       type: String,
@@ -131,7 +136,7 @@ const cleaningServiceSchema = new mongoose.Schema({
     notes: String
   }],
 
-  // NEW: Team Assignment
+  // Team
   team: [{
     cleaner: {
       type: mongoose.Schema.Types.ObjectId,
@@ -145,7 +150,7 @@ const cleaningServiceSchema = new mongoose.Schema({
     assignedTasks: [String]
   }],
 
-  // NEW: Service Checklist
+  // Checklist
   checklist: [{
     task: {
       type: String,
@@ -166,7 +171,7 @@ const cleaningServiceSchema = new mongoose.Schema({
     completedAt: Date
   }],
 
-  // NEW: Cancellation Policy
+  // Cancellation
   cancellationPolicy: {
     allowed: {
       type: Boolean,
@@ -184,53 +189,50 @@ const cleaningServiceSchema = new mongoose.Schema({
     }
   },
 
-    // NEW: Booking Frequency
+  // Booking frequency
   bookingFrequency: {
-  type: String,
-  enum: ['once-off', 'weekly', 'bi-weekly', 'monthly'],
-  default: 'once-off',
-  required: true
-},
+    type: String,
+    enum: ['once-off', 'weekly', 'bi-weekly', 'monthly'],
+    default: 'once-off',
+    required: true
+  },
 
-
-  // NEW: Rebooking Status
+  // Rebooking
   hasBeenRebooked: {
     type: Boolean,
     default: false
   },
-
-  // NEW: Rebooking Status
   CleanerhasAcceptedRebooking: {
     type: String,
-    enum: ['','Yes', 'No'],
+    enum: ['', 'Yes', 'No'],
     default: ''
   },
 
-  //NEW : Chat stuff
- requestedDates: [{
-  date: {
-    type: String, // can change to Date type if validated
-    required: true
+  // Chat & dates
+  requestedDates: [{
+    date: {
+      type: String, // consider Date if validated
+      required: true
+    },
+    timeOfArrival: {
+      type: String,
+      required: true
+    },
+    startTime: String,
+    endTime: String
+  }],
+
+  isRecurring: {
+    type: Boolean,
+    default: false
   },
-  timeOfArrival: {
-    type: String,
-    required: true
-  }
-}],
 
-  // New fields
-isRecurring: {
-  type: Boolean,
-  default: false
-},
-
-discountAmount: {
-  type: Number,
-  default: 0,
-  min: 0,
-  max: 100
-},
-
+  discountAmount: {
+    type: Number,
+    default: 0,
+    min: 0,
+    max: 1000000
+  },
 
   chatEnabled: {
     type: Boolean,
@@ -244,7 +246,7 @@ discountAmount: {
   },
   serviceStatus: {
     type: String,
-    enum: ['pending','assigned', 'completed', 'cancelled','expired'],
+    enum: ['pending','assigned','in_progress','completed','cancelled','expired'],
     default: 'pending'
   },
   unreadCounts: [{
@@ -256,7 +258,20 @@ discountAmount: {
       type: Number,
       default: 0
     }
-  }]
+  }],
+
+  // --- Proof-of-presence (arrival code) ---
+  arrivalVerification: {
+    codeHash: { type: String },           // sha256(salt + code)
+    salt: { type: String },               // per-code salt
+    generatedAt: { type: Date },
+    expiresAt: { type: Date },
+    attempts: { type: Number, default: 0 },
+    maxAttempts: { type: Number, default: 5 },
+    verifiedAt: { type: Date },
+    verifiedByCleaner: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
+  }
+
 }, { 
   timestamps: true,
   toJSON: { virtuals: true },
@@ -269,31 +284,27 @@ cleaningServiceSchema.virtual('requestedDates.duration').get(function() {
 
   return this.requestedDates.map(date => {
     if (!date?.startTime || !date?.endTime) return null;
-
     const [startH, startM] = date.startTime.split(':').map(Number);
     const [endH, endM] = date.endTime.split(':').map(Number);
-
     return (endH - startH) + (endM - startM) / 60;
   });
 });
 
-
-// Indexes for performance
+// Indexes
 cleaningServiceSchema.index({ propertyID: 1 });
 cleaningServiceSchema.index({ cleanerID: 1 });
 cleaningServiceSchema.index({ requestingUserID: 1 });
 cleaningServiceSchema.index({ 'requestedDates.date': 1 });
 cleaningServiceSchema.index({ serviceStatus: 1 });
+cleaningServiceSchema.index({ 'arrivalVerification.expiresAt': 1 });
 
-// Auto-generate checklist from extras if checklist is empty
+// Pre-save discount & checklist/payment bootstrapping
 cleaningServiceSchema.pre('save', function(next) {
-  // Discount logic
   const isRecurringBooking = this.bookingFrequency && this.bookingFrequency !== 'once-off';
-
-  this.isRecurring = isRecurringBooking; // Sync with flag
+  this.isRecurring = isRecurringBooking; // Sync
 
   const base = this.baseFee || 0;
-  const extrasTotal = this.extras.reduce((sum, extra) => sum + (extra.fee || 0), 0);
+  const extrasTotal = (this.extras || []).reduce((sum, extra) => sum + (extra.fee || 0), 0);
   const totalBeforeDiscount = base + extrasTotal;
 
   // Apply discount
@@ -304,20 +315,18 @@ cleaningServiceSchema.pre('save', function(next) {
   }
 
   const totalAfterDiscount = totalBeforeDiscount - this.discountAmount;
-
-  // Set serviceFee
   this.serviceFee = totalAfterDiscount;
 
-  // Auto-generate checklist if empty
+  // Auto checklist
   if (this.isModified('extras') && (!this.checklist || this.checklist.length === 0)) {
-    this.checklist = this.extras.map(extra => ({
+    this.checklist = (this.extras || []).map(extra => ({
       task: extra.name,
       completedCleaner: false,
       completedRequester: false
     }));
   }
 
-  // Initialize payments if not yet set
+  // Initialize payments if empty
   if ((!this.payments || this.payments.length === 0) && base != null) {
     this.payments = [{
       amount: totalAfterDiscount,
@@ -331,23 +340,88 @@ cleaningServiceSchema.pre('save', function(next) {
   next();
 });
 
-
-
-// Virtual: Total Amount Paid
+// Virtuals
 cleaningServiceSchema.virtual('totalAmountPaid').get(function () {
-  return this.payments
+  return (this.payments || [])
     .filter(p => p.status === 'completed')
     .reduce((sum, p) => sum + p.amount, 0);
 });
 
-// Virtual: Is Fully Paid
 cleaningServiceSchema.virtual('isFullyPaid').get(function () {
   return this.totalAmountPaid >= this.serviceFee;
 });
 
+cleaningServiceSchema.virtual('arrivalVerified').get(function () {
+  const v = this.arrivalVerification || {};
+  return !!v.verifiedAt;
+});
 
+// --- Arrival Code helpers ---
+const ARRIVAL_DEFAULT_TTL_MIN = 2;
+const ARRIVAL_MAX_ATTEMPTS = 5;
 
+cleaningServiceSchema.methods.generateArrivalCode = function (ttlMinutes = ARRIVAL_DEFAULT_TTL_MIN) {
+  const code = String(Math.floor(Math.random() * 1_000_000)).padStart(6, '0'); // 6 digits
+  const salt = crypto.randomBytes(16).toString('hex');
+  const codeHash = crypto.createHash('sha256').update(salt + code).digest('hex');
 
+  const now = new Date();
+  const expires = new Date(now.getTime() + (ttlMinutes * 60 * 1000));
 
+  this.arrivalVerification = {
+    codeHash,
+    salt,
+    generatedAt: now,
+    expiresAt: expires,
+    attempts: 0,
+    maxAttempts: ARRIVAL_MAX_ATTEMPTS,
+    verifiedAt: null,
+    verifiedByCleaner: null
+  };
+
+  return code; // plaintext for display/send only
+};
+
+cleaningServiceSchema.methods.verifyArrivalCode = async function (submittedCode, cleanerId) {
+  const v = this.arrivalVerification || {};
+  const now = new Date();
+
+  if (!v.codeHash || !v.salt || !v.expiresAt) {
+    throw new Error('No active arrival code. Ask the customer to generate a new one.');
+  }
+  if (v.verifiedAt) {
+    return { ok: true, alreadyVerified: true };
+  }
+  if (v.attempts >= (v.maxAttempts || ARRIVAL_MAX_ATTEMPTS)) {
+    throw new Error('Too many attempts. Code locked. Ask the customer to generate a new code.');
+  }
+  if (now > v.expiresAt) {
+    throw new Error('Code expired. Ask the customer to generate a new code.');
+  }
+
+  const candidate = crypto.createHash('sha256').update(v.salt + submittedCode).digest('hex');
+
+  // timingSafeEqual requires same length buffers; ensure hex -> Buffer
+  const ok = candidate.length === v.codeHash.length &&
+    crypto.timingSafeEqual(Buffer.from(candidate, 'hex'), Buffer.from(v.codeHash, 'hex'));
+
+  if (ok) {
+    this.arrivalVerification.verifiedAt = now;
+    this.arrivalVerification.verifiedByCleaner = cleanerId || null;
+
+    if (this.serviceStatus === 'assigned') {
+      this.serviceStatus = 'in_progress';
+      this.chatEnabled = true;
+    }
+
+    await this.save();
+    return { ok: true, verified: true };
+  }
+
+  this.arrivalVerification.attempts = (v.attempts || 0) + 1;
+  await this.save();
+  const remaining = (this.arrivalVerification.maxAttempts || ARRIVAL_MAX_ATTEMPTS) - this.arrivalVerification.attempts;
+  throw new Error(remaining > 0 ? `Invalid code. ${remaining} attempt(s) left.` : 'Too many attempts. Code locked.');
+};
 
 module.exports = mongoose.model('CleaningService', cleaningServiceSchema);
