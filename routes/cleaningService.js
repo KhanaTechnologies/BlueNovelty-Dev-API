@@ -6,6 +6,130 @@ const User = require('../models/user');
 const CleaningService = require('./../models/CleaningService.model');
 const validateUser = require('../utils/validateUser');
 
+// 🧹 Helper: expire/clean stale requests
+async function expireStaleRequests(maxAgeHours = 12) {
+  const cutoff = new Date(Date.now() - maxAgeHours * 60 * 60 * 1000);
+
+  // Only touch requests that are still open (not completed/cancelled/expired)
+  const staleServices = await CleaningService.find({
+    createdAt: { $lte: cutoff },
+    serviceStatus: { $nin: ['completed', 'cancelled', 'expired'] }
+  }).select('_id requestingUserID serviceFee name');
+
+  for (const svc of staleServices) {
+    try {
+      // 1) Expire the service
+      await CleaningService.findByIdAndUpdate(
+        svc._id,
+        { $set: { serviceStatus: 'expired' } },
+        { new: false }
+      );
+
+      // 2) Refund the requester and decrement active count (never below 0)
+      if (svc.requestingUserID) {
+        await User.findByIdAndUpdate(
+          svc.requestingUserID,
+          {
+            $inc: {
+              balance: svc.serviceFee || 0,
+              numberOfActiveServiceRequests: -1
+            },
+            $push: {
+              notifications: {
+                title: 'Request Expired',
+                message: `Your service "${svc.name || 'Cleaning Service'}" expired because it was inactive for more than 12 hours. We've refunded your balance.`,
+                type: 'warning',
+                link: `/services/${svc._id}`
+              }
+            }
+          }
+        );
+
+        // Guard against negative active counts
+        await User.updateOne(
+          { _id: svc.requestingUserID, numberOfActiveServiceRequests: { $lt: 0 } },
+          { $set: { numberOfActiveServiceRequests: 0 } }
+        );
+      }
+    } catch (e) {
+      // Keep going even if one service fails to update
+      console.error('[expireStaleRequests] Failed for service', svc._id, e);
+    }
+  }
+
+  return staleServices.length;
+}
+
+
+// ====== Cancellation Policy & Helpers ======
+const POLICY = {
+  CLEANER_CANCEL_LOCK_HOURS: 12,          // cleaner cannot cancel inside this window without penalty
+  CLIENT_CANCEL_MIN_HOURS: 3,             // client must cancel >= 3h before TOA
+  NO_ACCESS_CLIENT_PENALTY_PCT: 0.50,     // 50% of quoted amount
+  CLEANER_LATE_CANCEL_PCT: Number(process.env.LATE_CLEANER_CANCEL_PCT || 0.15), // default 15%
+  REASSIGNMENT_NOTIFICATION_BATCH: 10
+};
+
+function _getTOA(service) {
+  return service.timeOfArrival || service.scheduledFor || service.startTime || service.bookedFor || null;
+}
+function _hoursUntil(dateish) {
+  const t = new Date(dateish);
+  return (t.getTime() - Date.now()) / (1000 * 60 * 60);
+}
+function _hasArrivedOrStarted(service) {
+  return Boolean(
+    service.cleanerArrived === true ||
+    service.cleaningStarted === true ||
+    ['in_progress', 'arrived', 'started'].includes(service.serviceStatus)
+  );
+}
+async function _notify(userId, payload) {
+  try {
+    await User.findByIdAndUpdate(userId, {
+      $push: { notifications: { ...payload, createdAt: new Date() } }
+    });
+  } catch (e) {
+    console.error('[notify] failed', userId, e);
+  }
+}
+
+// Notify available cleaners to step in
+async function _attemptReassignCleaner(service) {
+  try {
+    await CleaningService.findByIdAndUpdate(service._id, { $set: { serviceStatus: 'awaiting_reassignment' } });
+  } catch (e) {}
+
+  const candidates = await User.find({
+    _id: { $ne: service.cleanerID },
+    role: 'cleaner',
+    status: 'active'
+  })
+    .select('_id name email')
+    .limit(POLICY.REASSIGNMENT_NOTIFICATION_BATCH);
+
+  const note = {
+    title: 'New job available',
+    message: `A job needs coverage${service.location ? ' near ' + service.location : ''}. Tap to review and accept.`,
+    type: 'job-offer',
+    link: `/services/${service._id}`
+  };
+
+  await Promise.all(candidates.map(c => _notify(c._id, note)));
+
+  if (service.requestingUserID) {
+    await _notify(service.requestingUserID, {
+      title: 'We’re finding a replacement cleaner',
+      message: 'Your assigned cleaner cancelled. We’re notifying others who can step in.',
+      type: 'info',
+      link: `/services/${service._id}`
+    });
+  }
+
+  return candidates.length;
+}
+
+
 // CREATE a new cleaning service
 router.post('/', validateUser, async (req, res) => {
   try {
@@ -69,6 +193,10 @@ router.post('/', validateUser, async (req, res) => {
 // GET all cleaning services
 router.get('/', validateUser, async (req, res) => {
   try {
+    
+    // Auto-clean before returning the list
+    await expireStaleRequests(12);
+
     const services = await CleaningService.find()
       .populate('team.cleaner', 'name email')
       .populate('requestingUserID cleanerID')
@@ -669,5 +797,158 @@ router.put('/expire-services', validateUser, async (req, res) => {
     res.status(500).json({ message: 'Failed to expire services', error: err.message });
   }
 });
+
+// ====== Cancellation & No-Access Routes ======
+
+// Cleaner cancels (penalty if inside 12h; trigger reassignment)
+router.post('/:id/cancel/cleaner', validateUser, async (req, res) => {
+  try {
+    const service = await CleaningService.findById(req.params.id);
+    if (!service) return res.status(404).json({ message: 'Service not found' });
+
+    if (String(service.cleanerID) !== String(req.userId) && req.user?.role !== 'admin') {
+      return res.status(403).json({ message: 'Not allowed to cancel this job' });
+    }
+
+    const toa = _getTOA(service);
+    if (!toa) return res.status(422).json({ message: 'Service has no Time of Arrival set' });
+
+    const hrs = _hoursUntil(toa);
+    let penaltyAmount = 0;
+    if (hrs < POLICY.CLEANER_CANCEL_LOCK_HOURS) {
+      penaltyAmount = Math.max(0, Math.round((service.serviceFee || 0) * POLICY.CLEANER_LATE_CANCEL_PCT));
+    }
+
+    await CleaningService.findByIdAndUpdate(service._id, {
+      $set: {
+        serviceStatus: 'cancelled_by_cleaner',
+        cancellation: { by: 'cleaner', at: new Date(), lateWindowHours: POLICY.CLEANER_CANCEL_LOCK_HOURS, penaltyAmount }
+      }
+    });
+
+    if (penaltyAmount > 0 && service.cleanerID) {
+      await User.findByIdAndUpdate(service.cleanerID, {
+        $inc: { balance: -penaltyAmount },
+        $push: {
+          penalties: { type: 'late_cleaner_cancellation', amount: penaltyAmount, service: service._id, at: new Date() },
+          notifications: {
+            title: 'Late cancellation penalty',
+            message: `You cancelled within ${POLICY.CLEANER_CANCEL_LOCK_HOURS} hours of arrival. A penalty of ${penaltyAmount} has been applied.`,
+            type: 'warning',
+            link: `/services/${service._id}`
+          }
+        }
+      });
+    }
+
+    const notified = await _attemptReassignCleaner(service);
+
+    if (service.requestingUserID) {
+      await _notify(service.requestingUserID, {
+        title: 'Cleaner cancelled',
+        message: `Your cleaner cancelled. We notified ${notified} other cleaner(s) to step in.`,
+        type: 'warning',
+        link: `/services/${service._id}`
+      });
+    }
+
+    return res.status(200).json({ message: 'Cleaner cancellation processed', penaltyApplied: penaltyAmount, reassignmentNotifications: notified });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: 'Failed to cancel by cleaner', error: err.message });
+  }
+});
+
+// Client cancels (≥ 3h before TOA; blocked if arrived/started)
+router.post('/:id/cancel/client', validateUser, async (req, res) => {
+  try {
+    const service = await CleaningService.findById(req.params.id);
+    if (!service) return res.status(404).json({ message: 'Service not found' });
+
+    if (String(service.requestingUserID) !== String(req.userId) && req.user?.role !== 'admin') {
+      return res.status(403).json({ message: 'Not allowed to cancel this job' });
+    }
+
+    if (_hasArrivedOrStarted(service)) {
+      return res.status(409).json({ message: 'Cannot cancel — cleaner has arrived or the cleaning has commenced' });
+    }
+
+    const toa = _getTOA(service);
+    if (!toa) return res.status(422).json({ message: 'Service has no Time of Arrival set' });
+
+    const hrs = _hoursUntil(toa);
+    if (hrs < POLICY.CLIENT_CANCEL_MIN_HOURS) {
+      return res.status(409).json({
+        message: `Client cancellation must be at least ${POLICY.CLIENT_CANCEL_MIN_HOURS} hours before the Time of Arrival`
+      });
+    }
+
+    await CleaningService.findByIdAndUpdate(service._id, {
+      $set: { serviceStatus: 'cancelled_by_client', cancellation: { by: 'client', at: new Date() } }
+    });
+
+    if (service.requestingUserID) {
+      await User.findByIdAndUpdate(service.requestingUserID, {
+        $inc: { balance: service.serviceFee || 0, numberOfActiveServiceRequests: -1 },
+        $push: { notifications: {
+          title: 'Booking cancelled',
+          message: 'Your booking was cancelled and any applicable fees were refunded.',
+          type: 'info',
+          link: `/services/${service._id}`
+        } }
+      });
+      await User.updateOne(
+        { _id: service.requestingUserID, numberOfActiveServiceRequests: { $lt: 0 } },
+        { $set: { numberOfActiveServiceRequests: 0 } }
+      );
+    }
+
+    return res.status(200).json({ message: 'Client cancellation processed', refund: service.serviceFee || 0 });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: 'Failed to cancel by client', error: err.message });
+  }
+});
+
+// Client absent / no access at TOA → 50% penalty
+router.post('/:id/no-access', validateUser, async (req, res) => {
+  try {
+    const service = await CleaningService.findById(req.params.id);
+    if (!service) return res.status(404).json({ message: 'Service not found' });
+
+    // Assigned cleaner or admin can mark no-access
+    if (String(service.cleanerID) !== String(req.userId) && req.user?.role !== 'admin') {
+      return res.status(403).json({ message: 'Not allowed to mark no-access' });
+    }
+
+    const base = (service.quotedAmount || service.serviceFee || 0);
+    const penalty = Math.max(0, Math.round(base * POLICY.NO_ACCESS_CLIENT_PENALTY_PCT));
+
+    await CleaningService.findByIdAndUpdate(service._id, {
+      $set: { serviceStatus: 'no_access', noAccess: { at: new Date(), penalty } }
+    });
+
+    if (service.requestingUserID) {
+      await User.findByIdAndUpdate(service.requestingUserID, {
+        $inc: { balance: -penalty },
+        $push: {
+          penalties: { type: 'client_no_access', amount: penalty, service: service._id, at: new Date() },
+          notifications: {
+            title: 'No access fee applied',
+            message: `We could not access the property at the scheduled time. A 50% fee of ${penalty} has been charged.`,
+            type: 'warning',
+            link: `/services/${service._id}`
+          }
+        }
+      });
+    }
+
+    return res.status(200).json({ message: 'No access recorded', penaltyApplied: penalty });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: 'Failed to record no-access', error: err.message });
+  }
+});
+
 
 module.exports = { router, handleStreakLogic };
