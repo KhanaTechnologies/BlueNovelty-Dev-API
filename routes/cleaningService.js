@@ -70,9 +70,27 @@ const POLICY = {
   REASSIGNMENT_NOTIFICATION_BATCH: 10
 };
 
-function _getTOA(service) {
-  return service.timeOfArrival || service.scheduledFor || service.startTime || service.bookedFor || null;
+function _getOccurrence(service, dateIndex) {
+  // once-off service fallback
+  if (!service.isRecurring) {
+    const d = service.requestedDates?.[0];
+    if (!d) return null;
+    return { dateIndex: 0, occurrence: d };
+  }
+
+  if (typeof dateIndex !== 'number') return null;
+
+  const occurrence = service.requestedDates[dateIndex];
+  if (!occurrence) return null;
+
+  return { dateIndex, occurrence };
 }
+
+function _getTOAFromOccurrence(occurrence) {
+  if (!occurrence?.date || !occurrence?.timeOfArrival) return null;
+  return new Date(`${occurrence.date}T${occurrence.timeOfArrival}`);
+}
+
 function _hoursUntil(dateish) {
   const t = new Date(dateish);
   return (t.getTime() - Date.now()) / (1000 * 60 * 60);
@@ -803,61 +821,69 @@ router.put('/expire-services', validateUser, async (req, res) => {
 // Cleaner cancels (penalty if inside 12h; trigger reassignment)
 router.post('/:id/cancel/cleaner', validateUser, async (req, res) => {
   try {
+    const { dateIndex } = req.body;
+
     const service = await CleaningService.findById(req.params.id);
     if (!service) return res.status(404).json({ message: 'Service not found' });
 
-    if (String(service.cleanerID) !== String(req.userId) && req.user?.role !== 'admin') {
-      return res.status(403).json({ message: 'Not allowed to cancel this job' });
+    if (String(service.cleanerID) !== String(req.userId)) {
+      return res.status(403).json({ message: 'Not allowed' });
     }
 
-    const toa = _getTOA(service);
-    if (!toa) return res.status(422).json({ message: 'Service has no Time of Arrival set' });
+    const resolved = _getOccurrence(service, dateIndex);
+    if (!resolved) {
+      return res.status(422).json({ message: 'Invalid or missing dateIndex' });
+    }
+
+    const { occurrence } = resolved;
+    const toa = _getTOAFromOccurrence(occurrence);
+    if (!toa) {
+      return res.status(422).json({ message: 'Time of arrival not set for this service date' });
+    }
 
     const hrs = _hoursUntil(toa);
     let penaltyAmount = 0;
+
     if (hrs < POLICY.CLEANER_CANCEL_LOCK_HOURS) {
-      penaltyAmount = Math.max(0, Math.round((service.serviceFee || 0) * POLICY.CLEANER_LATE_CANCEL_PCT));
+      penaltyAmount = Math.round((service.serviceFee || 0) * POLICY.CLEANER_LATE_CANCEL_PCT);
     }
 
-    await CleaningService.findByIdAndUpdate(service._id, {
-      $set: {
-        serviceStatus: 'cancelled_by_cleaner',
-        cancellation: { by: 'cleaner', at: new Date(), lateWindowHours: POLICY.CLEANER_CANCEL_LOCK_HOURS, penaltyAmount }
-      }
-    });
+    occurrence.status = 'cancelled_by_cleaner';
+    occurrence.cancellation = {
+      by: 'cleaner',
+      at: new Date(),
+      penaltyAmount
+    };
 
-    if (penaltyAmount > 0 && service.cleanerID) {
+    await service.save();
+
+    if (penaltyAmount > 0) {
       await User.findByIdAndUpdate(service.cleanerID, {
         $inc: { balance: -penaltyAmount },
         $push: {
-          penalties: { type: 'late_cleaner_cancellation', amount: penaltyAmount, service: service._id, at: new Date() },
-          notifications: {
-            title: 'Late cancellation penalty',
-            message: `You cancelled within ${POLICY.CLEANER_CANCEL_LOCK_HOURS} hours of arrival. A penalty of ${penaltyAmount} has been applied.`,
-            type: 'warning',
-            link: `/services/${service._id}`
+          penalties: {
+            type: 'late_cleaner_cancellation',
+            amount: penaltyAmount,
+            service: service._id,
+            at: new Date()
           }
         }
       });
     }
 
-    const notified = await _attemptReassignCleaner(service);
+    await _attemptReassignCleaner(service);
 
-    if (service.requestingUserID) {
-      await _notify(service.requestingUserID, {
-        title: 'Cleaner cancelled',
-        message: `Your cleaner cancelled. We notified ${notified} other cleaner(s) to step in.`,
-        type: 'warning',
-        link: `/services/${service._id}`
-      });
-    }
-
-    return res.status(200).json({ message: 'Cleaner cancellation processed', penaltyApplied: penaltyAmount, reassignmentNotifications: notified });
+    res.json({
+      message: 'Cleaner cancelled service date',
+      dateIndex,
+      penaltyApplied: penaltyAmount
+    });
   } catch (err) {
     console.error(err);
-    return res.status(500).json({ message: 'Failed to cancel by cleaner', error: err.message });
+    res.status(500).json({ message: 'Cancellation failed', error: err.message });
   }
 });
+
 
 // Client cancels (≥ 3h before TOA; blocked if arrived/started)
 router.post('/:id/cancel/client', validateUser, async (req, res) => {

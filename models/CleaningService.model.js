@@ -219,7 +219,24 @@ const cleaningServiceSchema = new mongoose.Schema({
       required: true
     },
     startTime: String,
-    endTime: String
+    endTime: String,
+
+    status: {
+    type: String,
+    enum: ['scheduled', 'cancelled_by_cleaner', 'cancelled_by_user', 'completed'],
+    default: 'scheduled'
+    },
+    cancellation: {
+      by: {
+        type: String,
+        enum: ['cleaner', 'user']
+      },
+      at: Date,
+      penaltyAmount: {
+        type: Number,
+        default: 0
+      }
+    }
   }],
 
   isRecurring: {
