@@ -1,6 +1,12 @@
 const mongoose = require('mongoose');
 const validator = require('validator');
 
+const DECLINE_REASONS = [
+  'idDocument',
+  'proofOfResidency',
+  'policeClearance'
+];
+
 const userSchema = new mongoose.Schema({
   name: {
     type: String,
@@ -73,6 +79,10 @@ const userSchema = new mongoose.Schema({
     type: String,
     maxlength: [500, 'Document path too long']
   },
+  policeClearance: { 
+    type: String, 
+    maxlength: [500, 'Document path too long'] 
+  },
   cvOrSupportingDocs: {
     type: [String],
     maxlength: [500, 'Document path too long']
@@ -114,6 +124,20 @@ const userSchema = new mongoose.Schema({
     unique: true,
     sparse: true,
     maxlength: [10, 'phone number cannot exceed 10 characters']
+  },
+  accountStatus: {
+    type: String,
+    enum: ['registering', 'active', 'deactivated'],
+    default: 'registering' 
+  },
+  declineReasons: [{
+    type: String,
+    enum: DECLINE_REASONS
+  }],
+  adminNotes: {
+    type: String,
+    trim: true,
+    maxlength: [500, 'Admin notes cannot exceed 500 characters']
   },
   notifications: {
     type: [

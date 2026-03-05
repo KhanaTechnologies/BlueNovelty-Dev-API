@@ -98,7 +98,9 @@ router.post('/register', cpUpload, async (req, res) => {
       profileImage: fileUrls.profileImage || '',
       idDocument: fileUrls.idDocument || '',
       proofOfResidence: fileUrls.proofOfResidence || '',
-      cvOrSupportingDocs: fileUrls.cvOrSupportingDocs || []
+      policeClearance: fileUrls.policeClearance || '', 
+      cvOrSupportingDocs: fileUrls.cvOrSupportingDocs || [],
+      accountStatus: role === 'cleaner' ? 'registering' : 'active',
     });
 
     const savedUser = await user.save();
@@ -171,6 +173,12 @@ router.get('/me', validateUser, async (req, res) => {
   }
 });
 
+router.get('/:id', async (req, res) => {
+  const user = await User.findById(req.params.id);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  res.json(user);
+});
+
 router.put('/:id', cpUpload, async (req, res) => {
   console.log(req.body)
   try {
@@ -178,6 +186,14 @@ router.put('/:id', cpUpload, async (req, res) => {
     const currentUser = req.userId;
     const updateFields = { ...req.body };
     const fileUrls = await processUploads(req.files || {}, 'users');
+    const { accountStatus, declineReasons, adminNotes } = req.body;
+
+    if (accountStatus || declineReasons || adminNotes) {
+      const requester = await User.findById(currentUser);
+      if (!requester || requester.role !== 'admin') {
+        return res.status(403).json({ error: 'Only admins can update account status' });
+      }
+    }
 
     if (fileUrls.profileImage) {
       updateFields.profileImage = fileUrls.profileImage;
@@ -193,6 +209,11 @@ router.put('/:id', cpUpload, async (req, res) => {
     if (fileUrls.proofOfResidence) {
       updateFields.proofOfResidence = fileUrls.proofOfResidence;
       console.log('updateFields.proofOfResidence :', updateFields.proofOfResidence);
+    }
+
+    if (fileUrls.policeClearance) {
+      updateFields.policeClearance = fileUrls.policeClearance;
+      console.log('updateFields.policeClearance :', updateFields.policeClearance);
     }
 
     if (fileUrls.cvOrSupportingDocs) {
@@ -221,6 +242,24 @@ router.put('/:id', cpUpload, async (req, res) => {
     console.log(userId);
     const updatedUser = await User.findByIdAndUpdate(userId, updateFields, { new: true });
     console.log("hit 3");
+    
+    if (updateFields.accountStatus === 'active' && currentUser.toString() !== userId) {
+      await addNotification(
+      userId,
+      'Application Approved! 🎉',
+      'Congratulations! Your application has been approved. You can now receive cleaning jobs.',
+      'success',
+      '/dashboard'
+      );
+    } else if (updateFields.declineReasons?.length > 0 && currentUser.toString() !== userId) {
+      await addNotification(
+      userId,
+      'Application Needs Updates',
+      updateFields.adminNotes || 'Please review the flagged items on your profile and resubmit.',
+      'warning',
+      '/profile'
+      );
+    }
 
     if (!updatedUser) return res.status(404).json({ error: 'User not found' });
 
