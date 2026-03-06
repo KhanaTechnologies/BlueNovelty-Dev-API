@@ -36,6 +36,7 @@ const cpUpload = upload.fields([
   { name: 'profileImage', maxCount: 1 },
   { name: 'idDocument', maxCount: 1 },
   { name: 'proofOfResidence', maxCount: 1 },
+  { name: 'policeClearance', maxCount: 1 },
   { name: 'cvOrSupportingDocs', maxCount: 10 }
 ]);
 
@@ -61,6 +62,7 @@ const processUploads = async (files, pathPrefix) => {
   if (files['profileImage']) result.profileImage = await uploadFileToGitHub(files['profileImage'][0], pathPrefix);
   if (files['idDocument']) result.idDocument = await uploadFileToGitHub(files['idDocument'][0], pathPrefix);
   if (files['proofOfResidence']) result.proofOfResidence = await uploadFileToGitHub(files['proofOfResidence'][0], pathPrefix);
+  if (files['policeClearance']) result.policeClearance = await uploadFileToGitHub(files['policeClearance'][0], pathPrefix);
   if (files['cvOrSupportingDocs']) {
     result.cvOrSupportingDocs = await Promise.all(
       files['cvOrSupportingDocs'].map(file => uploadFileToGitHub(file, pathPrefix))
