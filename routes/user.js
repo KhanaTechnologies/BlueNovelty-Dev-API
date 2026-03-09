@@ -181,116 +181,274 @@ router.get('/:id', async (req, res) => {
   res.json(user);
 });
 
-router.put('/:id', cpUpload, async (req, res) => {
-  console.log(req.body)
-  try {
-    const userId = req.params.id;
-    const currentUser = req.userId;
-    const updateFields = { ...req.body };
-    const fileUrls = await processUploads(req.files || {}, 'users');
-    const { accountStatus, declineReasons, adminNotes } = req.body;
+const normalizeUploadedFiles = (updateFields, fileUrls) => {
+  if (fileUrls.profileImage) {
+    updateFields.profileImage = fileUrls.profileImage;
+  }
 
-    if (accountStatus || declineReasons || adminNotes) {
-      const requester = await User.findById(currentUser);
-      if (!requester || requester.role !== 'admin') {
-        return res.status(403).json({ error: 'Only admins can update account status' });
-      }
+  if (fileUrls.idDocument) {
+    updateFields.idDocument = fileUrls.idDocument;
+  }
+
+  if (fileUrls.proofOfResidence) {
+    updateFields.proofOfResidence = fileUrls.proofOfResidence;
+  }
+
+  if (fileUrls.policeClearance) {
+    updateFields.policeClearance = fileUrls.policeClearance;
+  }
+
+  if (fileUrls.cvOrSupportingDocs) {
+    if (Array.isArray(fileUrls.cvOrSupportingDocs)) {
+      updateFields.cvOrSupportingDocs = fileUrls.cvOrSupportingDocs.slice(-1);
+    } else {
+      updateFields.cvOrSupportingDocs = [fileUrls.cvOrSupportingDocs];
     }
+  }
+};
 
-    if (fileUrls.profileImage) {
-      updateFields.profileImage = fileUrls.profileImage;
-      console.log('updateFields.profileImage :', updateFields.profileImage);
-    }
+const handlePasswordUpdate = async (updateFields, userId) => {
+  if (!updateFields.password) return;
 
-    if (fileUrls.idDocument) {
-      // always a single string
-      updateFields.idDocument = fileUrls.idDocument;
-      console.log('updateFields.idDocument :', updateFields.idDocument);
-    }
+  updateFields.password = await bcrypt.hash(updateFields.password, 10);
 
-    if (fileUrls.proofOfResidence) {
-      updateFields.proofOfResidence = fileUrls.proofOfResidence;
-      console.log('updateFields.proofOfResidence :', updateFields.proofOfResidence);
-    }
+  await addNotification(
+    userId,
+    'Password Changed',
+    'Your password was successfully updated',
+    'security',
+    '/security'
+  );
+};
 
-    if (fileUrls.policeClearance) {
-      updateFields.policeClearance = fileUrls.policeClearance;
-      console.log('updateFields.policeClearance :', updateFields.policeClearance);
-    }
+const updateUserRecord = async (userId, updateFields) => {
+  return await User.findByIdAndUpdate(userId, updateFields, { new: true });
+};
 
-    if (fileUrls.cvOrSupportingDocs) {
-      // normalize so it’s always a flat array of strings (latest only)
-      if (Array.isArray(fileUrls.cvOrSupportingDocs)) {
-        updateFields.cvOrSupportingDocs = fileUrls.cvOrSupportingDocs.slice(-1); // keep only latest
-      } else {
-        updateFields.cvOrSupportingDocs = [fileUrls.cvOrSupportingDocs];
-      }
-      console.log('updateFields.cvOrSupportingDocs :', updateFields.cvOrSupportingDocs);
-    }
+const notifyProfileUpdate = async (userId, currentUser) => {
+  if (userId === currentUser.toString()) {
+    await addNotification(
+      userId,
+      'Profile Updated',
+      'Your profile information was successfully updated',
+      'info',
+      '/profile'
+    );
+  } else {
+    await addNotification(
+      userId,
+      'Profile Updated by Admin',
+      'Your profile was updated by an administrator',
+      'warning',
+      '/profile'
+    );
+  }
+};
 
-    console.log("hit 1");
-
-    if (updateFields.password) {
-      updateFields.password = await bcrypt.hash(updateFields.password, 10);
-      await addNotification(
-        userId,
-        'Password Changed',
-        'Your password was successfully updated',
-        'security',
-        '/security'
-      );
-    }
-
-    console.log(userId);
-    const updatedUser = await User.findByIdAndUpdate(userId, updateFields, { new: true });
-    console.log("hit 3");
-    
-    if (updateFields.accountStatus === 'active' && currentUser.toString() !== userId) {
-      await addNotification(
+const notifyAdminDecision = async (userId, updateFields, currentUser) => {
+  if (updateFields.accountStatus === 'active' && currentUser.toString() !== userId) {
+    await addNotification(
       userId,
       'Application Approved! 🎉',
       'Congratulations! Your application has been approved. You can now receive cleaning jobs.',
       'success',
       '/dashboard'
-      );
-    } else if (updateFields.declineReasons?.length > 0 && currentUser.toString() !== userId) {
-      await addNotification(
+    );
+  }
+
+  if (updateFields.declineReasons?.length > 0 && currentUser.toString() !== userId) {
+    await addNotification(
       userId,
       'Application Needs Updates',
       updateFields.adminNotes || 'Please review the flagged items on your profile and resubmit.',
       'warning',
       '/profile'
-      );
+    );
+  }
+};
+
+router.put('/:id/profile', cpUpload, async (req, res) => {
+  try {
+
+    const userId = req.params.id;
+    console.log(userId)
+    const currentUser = req.userId.userId;
+    console.log(currentUser)
+
+    if (userId !== currentUser.toString()) {
+      return res.status(403).json({ error: 'You can only edit your own profile' });
     }
 
-    if (!updatedUser) return res.status(404).json({ error: 'User not found' });
+    const updateFields = { ...req.body };
 
-    console.log("hit 2");
+    const fileUrls = await processUploads(req.files || {}, 'users');
 
-    if (userId === currentUser.toString()) {
-      await addNotification(
-        userId,
-        'Profile Updated',
-        'Your profile information was successfully updated',
-        'info',
-        '/profile'
-      );
-    } else {
-      await addNotification(
-        userId,
-        'Profile Updated by Admin',
-        'Your profile was updated by an administrator',
-        'warning',
-        '/profile'
-      );
+    normalizeUploadedFiles(updateFields, fileUrls);
+
+    await handlePasswordUpdate(updateFields, userId);
+
+    const updatedUser = await updateUserRecord(userId, updateFields);
+
+    if (!updatedUser) {
+      return res.status(404).json({ error: 'User not found' });
     }
+
+    await notifyProfileUpdate(userId, currentUser);
 
     res.json(updatedUser);
+
   } catch (error) {
-    console.error("Update user error:", error);
+    console.error("Profile update error:", error);
     res.status(500).json({ error: error.message });
   }
 });
+
+router.put('/:id/admin', cpUpload, async (req, res) => {
+  try {
+
+    const userId = req.params.id;
+    const currentUser = req.userId.userId;
+
+    const requester = await User.findById(currentUser);
+
+    if (!requester || requester.role !== 'admin') {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+
+    const updateFields = { ...req.body };
+
+    const fileUrls = await processUploads(req.files || {}, 'users');
+
+    normalizeUploadedFiles(updateFields, fileUrls);
+
+    const updatedUser = await updateUserRecord(userId, updateFields);
+
+    if (!updatedUser) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    await notifyAdminDecision(userId, updateFields, currentUser);
+
+    await notifyProfileUpdate(userId, currentUser);
+
+    res.json(updatedUser);
+
+  } catch (error) {
+    console.error("Admin update error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// router.put('/:id', cpUpload, async (req, res) => {
+//   console.log(req.body)
+//   try {
+//     const userId = req.params.id;
+//     const currentUser = req.userId;
+//     const updateFields = { ...req.body };
+//     const fileUrls = await processUploads(req.files || {}, 'users');
+//     const { accountStatus, declineReasons, adminNotes } = req.body;
+
+//     if (accountStatus || declineReasons || adminNotes) {
+//       const requester = await User.findById(currentUser);
+//       if (!requester || requester.role !== 'admin') {
+//         return res.status(403).json({ error: 'Only admins can update account status' });
+//       }
+//     }
+
+//     if (fileUrls.profileImage) {
+//       updateFields.profileImage = fileUrls.profileImage;
+//       console.log('updateFields.profileImage :', updateFields.profileImage);
+//     }
+
+//     if (fileUrls.idDocument) {
+//       // always a single string
+//       updateFields.idDocument = fileUrls.idDocument;
+//       console.log('updateFields.idDocument :', updateFields.idDocument);
+//     }
+
+//     if (fileUrls.proofOfResidence) {
+//       updateFields.proofOfResidence = fileUrls.proofOfResidence;
+//       console.log('updateFields.proofOfResidence :', updateFields.proofOfResidence);
+//     }
+
+//     if (fileUrls.policeClearance) {
+//       updateFields.policeClearance = fileUrls.policeClearance;
+//       console.log('updateFields.policeClearance :', updateFields.policeClearance);
+//     }
+
+//     if (fileUrls.cvOrSupportingDocs) {
+//       // normalize so it’s always a flat array of strings (latest only)
+//       if (Array.isArray(fileUrls.cvOrSupportingDocs)) {
+//         updateFields.cvOrSupportingDocs = fileUrls.cvOrSupportingDocs.slice(-1); // keep only latest
+//       } else {
+//         updateFields.cvOrSupportingDocs = [fileUrls.cvOrSupportingDocs];
+//       }
+//       console.log('updateFields.cvOrSupportingDocs :', updateFields.cvOrSupportingDocs);
+//     }
+
+//     console.log("hit 1");
+
+//     if (updateFields.password) {
+//       updateFields.password = await bcrypt.hash(updateFields.password, 10);
+//       await addNotification(
+//         userId,
+//         'Password Changed',
+//         'Your password was successfully updated',
+//         'security',
+//         '/security'
+//       );
+//     }
+
+//     console.log(userId);
+//     const updatedUser = await User.findByIdAndUpdate(userId, updateFields, { new: true });
+//     console.log("hit 3");
+    
+//     if (updateFields.accountStatus === 'active' && currentUser.toString() !== userId) {
+//       await addNotification(
+//       userId,
+//       'Application Approved! 🎉',
+//       'Congratulations! Your application has been approved. You can now receive cleaning jobs.',
+//       'success',
+//       '/dashboard'
+//       );
+//     } else if (updateFields.declineReasons?.length > 0 && currentUser.toString() !== userId) {
+//       await addNotification(
+//       userId,
+//       'Application Needs Updates',
+//       updateFields.adminNotes || 'Please review the flagged items on your profile and resubmit.',
+//       'warning',
+//       '/profile'
+//       );
+//     }
+
+//     if (!updatedUser) return res.status(404).json({ error: 'User not found' });
+
+//     console.log("hit 2");
+
+//     if (userId === currentUser.toString()) {
+//       await addNotification(
+//         userId,
+//         'Profile Updated',
+//         'Your profile information was successfully updated',
+//         'info',
+//         '/profile'
+//       );
+//     } else {
+//       await addNotification(
+//         userId,
+//         'Profile Updated by Admin',
+//         'Your profile was updated by an administrator',
+//         'warning',
+//         '/profile'
+//       );
+//     }
+
+//     res.json(updatedUser);
+//   } catch (error) {
+//     console.error("Update user error:", error);
+//     res.status(500).json({ error: error.message });
+//   }
+// });
 
 
 router.delete('/:id', async (req, res) => {
