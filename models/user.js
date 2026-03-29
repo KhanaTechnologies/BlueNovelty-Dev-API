@@ -3,8 +3,11 @@ const validator = require('validator');
 
 const DECLINE_REASONS = [
   'idDocument',
-  'proofOfResidency',
-  'policeClearance'
+  'proofOfResidence',
+  'policeClearance',
+  'cvOrSupportingDocs',
+  'profileImage',
+  'personalInfo'
 ];
 
 const userSchema = new mongoose.Schema({

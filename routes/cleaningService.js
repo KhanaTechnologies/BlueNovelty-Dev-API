@@ -205,14 +205,20 @@ async function _attemptReassignCleaner(service, options = {}) {
 
   if (setAwaitingStatus) {
     try {
-      await CleaningService.findByIdAndUpdate(service._id, { $set: { serviceStatus: 'awaiting_reassignment' } });
+      await CleaningService.findByIdAndUpdate(service._id, {
+        $set: {
+          serviceStatus: 'awaiting_reassignment',
+          cleanerID: null,
+          chatEnabled: false
+        }
+      });
     } catch (e) {}
   }
 
   const candidates = await User.find({
     _id: { $ne: service.cleanerID },
     role: 'cleaner',
-    status: 'active'
+    accountStatus: 'active'
   })
     .select('_id name email')
     .limit(POLICY.REASSIGNMENT_NOTIFICATION_BATCH);
@@ -396,6 +402,56 @@ router.get('/assigned', validateUser, async (req, res) => {
     res.status(200).json(services);
   } catch (err) {
     res.status(500).json({ message: 'Failed to fetch assigned services', error: err.message });
+  }
+});
+
+router.get('/user/:userId', validateUser, async (req, res) => {
+  try {
+    const requester = await User.findById(req.userId);
+
+    if (!requester || requester.role !== 'admin') {
+      return res.status(403).json({ message: 'Admin access required' });
+    }
+
+    const targetUser = await User.findById(req.params.userId).select('role');
+
+    if (!targetUser) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    const roleQuery = targetUser.role === 'cleaner'
+      ? { cleanerID: targetUser._id }
+      : { requestingUserID: targetUser._id };
+
+    const services = await CleaningService.find(roleQuery)
+      .populate('requestingUserID', 'name surname email')
+      .populate('cleanerID', 'name surname email')
+      .populate('propertyID')
+      .sort({ serviceDate: -1, createdAt: -1 });
+
+    const formattedServices = services.map((service) => ({
+      ...service.toObject(),
+      id: service._id,
+      status: service.serviceStatus,
+      totalPrice: service.serviceFee,
+      scheduledDate: service.serviceDate,
+      propertyAddress:
+        service.propertyID?.address
+        || service.propertyID?.propertyAddress
+        || service.propertyID?.streetAddress
+        || '',
+      requesterName: service.requestingUserID
+        ? `${service.requestingUserID.name || ''} ${service.requestingUserID.surname || ''}`.trim()
+        : '',
+      cleanerName: service.cleanerID
+        ? `${service.cleanerID.name || ''} ${service.cleanerID.surname || ''}`.trim()
+        : '',
+    }));
+
+    res.status(200).json(formattedServices);
+  } catch (err) {
+    console.error('Failed to fetch user services', err);
+    res.status(500).json({ message: 'Failed to fetch user services', error: err.message });
   }
 });
 
@@ -1055,6 +1111,9 @@ router.post('/:id/cancel/cleaner', validateUser, async (req, res) => {
         at: new Date(),
         penaltyAmount
       };
+      service.cleanerID = null;
+      service.chatEnabled = false;
+      service.serviceStatus = 'awaiting_reassignment';
       await service.save();
     }
 
