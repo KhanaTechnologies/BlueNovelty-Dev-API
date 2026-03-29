@@ -9,6 +9,26 @@ const CleaningService = require('../models/CleaningService.model');
 const router = express.Router();
 router.use(authJwt());
 
+router.get('/unread/count', validateUser, async (req, res) => {
+  try {
+    const userId = req.userId;
+
+    const unreadCount = await Message.countDocuments({
+      recipients: {
+        $elemMatch: {
+          user: userId,
+          read: false
+        }
+      }
+    });
+
+    res.json({ count: unreadCount });
+  } catch (error) {
+    console.error('Error fetching unread count:', error);
+    res.status(500).json({ error: 'Failed to fetch unread message count' });
+  }
+});
+
 // Create message with notifications
 router.post('/', validateUser, async (req, res) => {
   try {

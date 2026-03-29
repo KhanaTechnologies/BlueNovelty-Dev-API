@@ -91,6 +91,93 @@ function _getTOAFromOccurrence(occurrence) {
   return new Date(`${occurrence.date}T${occurrence.timeOfArrival}`);
 }
 
+function _cloneChecklist(checklist = []) {
+  return checklist.map(item => ({
+    task: item.task,
+    completedCleaner: false,
+    completedRequester: false
+  }));
+}
+
+function _reindexChecklistsByDate(checklistsByDate = {}, removedIndex) {
+  const reindexed = {};
+
+  Object.keys(checklistsByDate).forEach((key) => {
+    const numericKey = Number(key);
+
+    if (numericKey === removedIndex) {
+      return;
+    }
+
+    const nextKey = numericKey > removedIndex ? numericKey - 1 : numericKey;
+    reindexed[nextKey] = checklistsByDate[key];
+  });
+
+  return reindexed;
+}
+
+function _getChecklistForOccurrence(service, dateIndex) {
+  if (service.checklistsByDate && typeof service.checklistsByDate === 'object' && service.checklistsByDate[dateIndex]) {
+    return _cloneChecklist(service.checklistsByDate[dateIndex]);
+  }
+
+  return _cloneChecklist(service.checklist || []);
+}
+
+async function _createReplacementServiceForOccurrence(service, dateIndex, occurrence) {
+  const serviceData = service.toObject();
+  const replacementChecklist = _getChecklistForOccurrence(service, dateIndex);
+
+  delete serviceData._id;
+  delete serviceData.id;
+  delete serviceData.createdAt;
+  delete serviceData.updatedAt;
+
+  const replacementService = new CleaningService({
+    ...serviceData,
+    requestedDates: [{
+      date: occurrence.date,
+      timeOfArrival: occurrence.timeOfArrival,
+      startTime: occurrence.startTime,
+      endTime: occurrence.endTime,
+      status: 'scheduled',
+      arrivalStatus: 'not_arrived'
+    }],
+    bookingFrequency: 'once-off',
+    isRecurring: false,
+    cleanerID: undefined,
+    serviceStatus: 'pending',
+    checklist: replacementChecklist,
+    checklistsByDate: undefined,
+    cleanerMarkedComplete: false,
+    cleanerCompletedAt: undefined,
+    requesterConfirmedAt: undefined,
+    arrivalVerification: undefined
+  });
+
+  return replacementService.save();
+}
+
+function _removeOccurrenceFromService(service, dateIndex) {
+  if (!Array.isArray(service.requestedDates) || !service.requestedDates[dateIndex]) {
+    return;
+  }
+
+  service.requestedDates.splice(dateIndex, 1);
+
+  if (service.checklistsByDate && typeof service.checklistsByDate === 'object') {
+    service.checklistsByDate = _reindexChecklistsByDate(service.checklistsByDate, dateIndex);
+  }
+
+  if (service.requestedDates.length <= 1) {
+    service.isRecurring = false;
+    if (service.requestedDates.length === 1 && service.checklistsByDate?.[0]) {
+      service.checklist = service.checklistsByDate[0];
+      service.checklistsByDate = undefined;
+    }
+  }
+}
+
 function _hoursUntil(dateish) {
   const t = new Date(dateish);
   return (t.getTime() - Date.now()) / (1000 * 60 * 60);
@@ -113,10 +200,14 @@ async function _notify(userId, payload) {
 }
 
 // Notify available cleaners to step in
-async function _attemptReassignCleaner(service) {
-  try {
-    await CleaningService.findByIdAndUpdate(service._id, { $set: { serviceStatus: 'awaiting_reassignment' } });
-  } catch (e) {}
+async function _attemptReassignCleaner(service, options = {}) {
+  const { setAwaitingStatus = true } = options;
+
+  if (setAwaitingStatus) {
+    try {
+      await CleaningService.findByIdAndUpdate(service._id, { $set: { serviceStatus: 'awaiting_reassignment' } });
+    } catch (e) {}
+  }
 
   const candidates = await User.find({
     _id: { $ne: service.cleanerID },
@@ -157,18 +248,22 @@ router.post('/', validateUser, async (req, res) => {
       return res.status(404).json({ message: 'User not found' });
     }
 
-    const { baseFee = 0, extras = [], bookingFrequency = 'once-off' } = req.body;
+    const { baseFee = 0, extras = [], bookingFrequency = 'once-off', requestedDates = [] } = req.body;
 
     const validExtras = Array.isArray(extras) ? extras : [];
     const extrasTotal = validExtras.reduce((sum, item) => sum + (item.fee || 0), 0);
+    const validRequestedDates = Array.isArray(requestedDates) ? requestedDates.filter(date => date?.date) : [];
+    const occurrenceCount = Math.max(validRequestedDates.length, 1);
 
-    let totalFee = baseFee + extrasTotal;
+    let perOccurrenceFee = baseFee + extrasTotal;
 
     // Apply 10% discount for recurring bookings
-    const isRecurring = bookingFrequency !== 'once-off';
+    const isRecurring = bookingFrequency !== 'once-off' || occurrenceCount > 1 || !!req.body.isRecurring;
     if (isRecurring) {
-      totalFee = totalFee * 0.9; // 10% discount
+      perOccurrenceFee = perOccurrenceFee * 0.9; // 10% discount
     }
+
+    const totalFee = perOccurrenceFee * occurrenceCount;
 
     if (user.balance < totalFee) {
       return res.status(400).json({
@@ -181,13 +276,52 @@ router.post('/', validateUser, async (req, res) => {
     user.balance -= totalFee;
     user.numberOfActiveServiceRequests += 1; // Increment here
     await user.save();
+    
+    if (isRecurring && validRequestedDates.length > 1) {
+      const recurringSeriesId = new mongoose.Types.ObjectId().toString();
+      const recurringSeriesLabel = `${String(req.body.serviceType || 'service').replace(/[_-]/g, ' ')} series`;
+
+      const savedServices = [];
+
+      for (let index = 0; index < validRequestedDates.length; index++) {
+        const occurrence = validRequestedDates[index];
+        const newService = new CleaningService({
+          ...req.body,
+          requestingUserID: userId,
+          baseFee,
+          serviceFee: perOccurrenceFee,
+          requestedDates: [occurrence],
+          bookingFrequency: 'once-off',
+          isRecurring: false,
+          recurringSeriesId,
+          recurringSeriesLabel,
+          recurringOccurrenceIndex: index,
+          recurringOccurrenceCount: validRequestedDates.length
+        });
+
+        const saved = await newService.save();
+        savedServices.push(saved);
+      }
+
+      const primaryService = savedServices[0];
+      return res.status(201).json({
+        ...primaryService.toObject(),
+        recurringSeriesId,
+        recurringSeriesLabel,
+        recurringOccurrenceCount: savedServices.length,
+        seriesServiceIds: savedServices.map(service => service._id),
+        createdServices: savedServices
+      });
+    }
 
     const newService = new CleaningService({
       ...req.body,
       requestingUserID: userId,
       baseFee,
-      serviceFee: totalFee, // Save the final fee to DB
-      isRecurring: isRecurring
+      serviceFee: perOccurrenceFee,
+      requestedDates: validRequestedDates.length > 0 ? [validRequestedDates[0]] : req.body.requestedDates,
+      isRecurring: false,
+      recurringOccurrenceCount: 1
     });
 
     const savedService = await newService.save();
@@ -270,7 +404,7 @@ router.get('/assigned', validateUser, async (req, res) => {
 // Generate (or regenerate) an arrival code — only the requesting user can do this
 router.post('/:id/generate-arrival-code', validateUser, async (req, res) => {
   try {
-    const { ttlMinutes } = req.body || {};
+    const { ttlMinutes, dateIndex } = req.body || {};
     const serviceId = req.params.id;
 
     if (!mongoose.isValidObjectId(serviceId)) {
@@ -284,20 +418,24 @@ router.post('/:id/generate-arrival-code', validateUser, async (req, res) => {
       return res.status(403).json({ message: 'Only the requesting user can generate the arrival code' });
     }
 
-    // Optional: only allow generation when assigned
-    if (service.serviceStatus !== 'assigned') {
-      return res.status(400).json({ message: 'Arrival code can only be generated when the service is assigned' });
+    const minutes = Number(ttlMinutes) > 0 ? Number(ttlMinutes) : 60;
+    const resolved = _getOccurrence(service, typeof dateIndex === 'number' ? dateIndex : 0);
+    if (!resolved) {
+      return res.status(422).json({ message: 'Invalid or missing dateIndex' });
     }
 
-    const minutes = 2; // fixed lifetime
-    const code = service.generateArrivalCode(minutes);
+    const code = service.generateArrivalCode(minutes, resolved.dateIndex);
     await service.save();
 
-    // TODO: send via SMS/email/push; returning for now
+    const arrivalVerification = service.isRecurring && service.requestedDates?.[resolved.dateIndex]
+      ? service.requestedDates[resolved.dateIndex].arrivalVerification
+      : service.arrivalVerification;
+
     res.status(200).json({
       message: 'Arrival code generated',
       code,
-      expiresAt: service.arrivalVerification.expiresAt
+      dateIndex: resolved.dateIndex,
+      expiresAt: arrivalVerification?.expiresAt
     });
   } catch (err) {
     console.error('Generate arrival code error:', err);
@@ -309,7 +447,7 @@ router.post('/:id/generate-arrival-code', validateUser, async (req, res) => {
 router.post('/:id/verify-arrival', validateUser, async (req, res) => {
   try {
     const serviceId = req.params.id;
-    const { code } = req.body;
+    const { code, dateIndex } = req.body;
 
     if (!mongoose.isValidObjectId(serviceId)) {
       return res.status(400).json({ message: 'Invalid service ID' });
@@ -325,7 +463,12 @@ router.post('/:id/verify-arrival', validateUser, async (req, res) => {
       return res.status(403).json({ message: 'Only the assigned cleaner can verify arrival' });
     }
 
-    const result = await service.verifyArrivalCode(code, req.userId);
+    const resolved = _getOccurrence(service, typeof dateIndex === 'number' ? dateIndex : 0);
+    if (!resolved) {
+      return res.status(422).json({ message: 'Invalid or missing dateIndex' });
+    }
+
+    const result = await service.verifyArrivalCode(code, req.userId, resolved.dateIndex);
 
     try {
       await User.findByIdAndUpdate(service.requestingUserID, {
@@ -342,8 +485,11 @@ router.post('/:id/verify-arrival', validateUser, async (req, res) => {
 
     res.status(200).json({
       message: result.alreadyVerified ? 'Already verified' : 'Arrival verified',
+      dateIndex: resolved.dateIndex,
       serviceStatus: service.serviceStatus,
-      verifiedAt: service.arrivalVerification?.verifiedAt
+      verifiedAt: service.isRecurring && service.requestedDates?.[resolved.dateIndex]
+        ? service.requestedDates[resolved.dateIndex].arrivalVerification?.verifiedAt
+        : service.arrivalVerification?.verifiedAt
     });
   } catch (err) {
     console.error('Verify arrival error:', err);
@@ -443,6 +589,32 @@ router.put('/:id', validateUser, async (req, res) => {
       { new: true, runValidators: true }
     ).populate('requestingUserID cleanerID');
 
+    if (
+      req.body?.serviceStatus === 'assigned' &&
+      req.body?.cleanerID &&
+      updated?.recurringSeriesId
+    ) {
+      await CleaningService.updateMany(
+        {
+          _id: { $ne: updated._id },
+          recurringSeriesId: updated.recurringSeriesId,
+          serviceStatus: 'pending',
+          $or: [
+            { cleanerID: { $exists: false } },
+            { cleanerID: null },
+            { cleanerID: '' }
+          ]
+        },
+        {
+          $set: {
+            cleanerID: req.body.cleanerID,
+            serviceStatus: 'assigned',
+            chatEnabled: true
+          }
+        }
+      );
+    }
+
     // Check checklist items
     const checklist = updated.checklist || [];
     const allTasksCompleted = checklist.length > 0 && checklist.every(task =>
@@ -455,6 +627,23 @@ router.put('/:id', validateUser, async (req, res) => {
       existing.serviceStatus !== 'completed' && 
       updated.serviceStatus === 'completed'
     );
+    const cleanerMarkedCompleteJustNow = !existing.cleanerMarkedComplete && !!updated.cleanerMarkedComplete;
+
+    if (cleanerMarkedCompleteJustNow && updated.requestingUserID?._id) {
+      await User.findByIdAndUpdate(
+        updated.requestingUserID._id,
+        {
+          $push: {
+            notifications: {
+              title: 'Cleaner Ready For Confirmation',
+              message: `Your cleaner has finished the checklist for "${updated.name || 'Cleaning Service'}". Please review and confirm completion.`,
+              type: 'info',
+              link: `/services/${updated._id}`
+            }
+          }
+        }
+      );
+    }
 
     // Handle notifications for status changes
     if (statusJustChanged) {
@@ -848,14 +1037,26 @@ router.post('/:id/cancel/cleaner', validateUser, async (req, res) => {
       penaltyAmount = Math.round((service.serviceFee || 0) * POLICY.CLEANER_LATE_CANCEL_PCT);
     }
 
-    occurrence.status = 'cancelled_by_cleaner';
-    occurrence.cancellation = {
-      by: 'cleaner',
-      at: new Date(),
-      penaltyAmount
-    };
+    let replacementService = null;
 
-    await service.save();
+    if (service.isRecurring && service.requestedDates?.length > 1) {
+      replacementService = await _createReplacementServiceForOccurrence(service, resolved.dateIndex, occurrence);
+      _removeOccurrenceFromService(service, resolved.dateIndex);
+
+      if (service.requestedDates.length === 0) {
+        service.serviceStatus = 'cancelled';
+      }
+
+      await service.save();
+    } else {
+      occurrence.status = 'cancelled_by_cleaner';
+      occurrence.cancellation = {
+        by: 'cleaner',
+        at: new Date(),
+        penaltyAmount
+      };
+      await service.save();
+    }
 
     if (penaltyAmount > 0) {
       await User.findByIdAndUpdate(service.cleanerID, {
@@ -871,12 +1072,17 @@ router.post('/:id/cancel/cleaner', validateUser, async (req, res) => {
       });
     }
 
-    await _attemptReassignCleaner(service);
+    if (replacementService) {
+      await _attemptReassignCleaner(replacementService, { setAwaitingStatus: false });
+    } else {
+      await _attemptReassignCleaner(service);
+    }
 
     res.json({
       message: 'Cleaner cancelled service date',
       dateIndex,
-      penaltyApplied: penaltyAmount
+      penaltyApplied: penaltyAmount,
+      replacementServiceId: replacementService?._id
     });
   } catch (err) {
     console.error(err);
@@ -888,6 +1094,7 @@ router.post('/:id/cancel/cleaner', validateUser, async (req, res) => {
 // Client cancels (≥ 3h before TOA; blocked if arrived/started)
 router.post('/:id/cancel/client', validateUser, async (req, res) => {
   try {
+    const { dateIndex } = req.body || {};
     const service = await CleaningService.findById(req.params.id);
     if (!service) return res.status(404).json({ message: 'Service not found' });
 
@@ -899,7 +1106,12 @@ router.post('/:id/cancel/client', validateUser, async (req, res) => {
       return res.status(409).json({ message: 'Cannot cancel — cleaner has arrived or the cleaning has commenced' });
     }
 
-    const toa = _getTOA(service);
+    const resolved = _getOccurrence(service, typeof dateIndex === 'number' ? dateIndex : 0);
+    if (!resolved) {
+      return res.status(422).json({ message: 'Invalid or missing dateIndex' });
+    }
+
+    const toa = _getTOAFromOccurrence(resolved.occurrence);
     if (!toa) return res.status(422).json({ message: 'Service has no Time of Arrival set' });
 
     const hrs = _hoursUntil(toa);
@@ -909,9 +1121,21 @@ router.post('/:id/cancel/client', validateUser, async (req, res) => {
       });
     }
 
-    await CleaningService.findByIdAndUpdate(service._id, {
-      $set: { serviceStatus: 'cancelled_by_client', cancellation: { by: 'client', at: new Date() } }
-    });
+    if (service.isRecurring && service.requestedDates?.length > 1) {
+      resolved.occurrence.status = 'cancelled_by_user';
+      resolved.occurrence.cancellation = { by: 'user', at: new Date() };
+      _removeOccurrenceFromService(service, resolved.dateIndex);
+
+      if (service.requestedDates.length === 0) {
+        service.serviceStatus = 'cancelled_by_client';
+      }
+
+      await service.save();
+    } else {
+      await CleaningService.findByIdAndUpdate(service._id, {
+        $set: { serviceStatus: 'cancelled_by_client', cancellation: { by: 'client', at: new Date() } }
+      });
+    }
 
     if (service.requestingUserID) {
       await User.findByIdAndUpdate(service.requestingUserID, {
@@ -929,7 +1153,7 @@ router.post('/:id/cancel/client', validateUser, async (req, res) => {
       );
     }
 
-    return res.status(200).json({ message: 'Client cancellation processed', refund: service.serviceFee || 0 });
+    return res.status(200).json({ message: 'Client cancellation processed', refund: service.serviceFee || 0, dateIndex: resolved.dateIndex });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ message: 'Failed to cancel by client', error: err.message });
@@ -939,6 +1163,7 @@ router.post('/:id/cancel/client', validateUser, async (req, res) => {
 // Client absent / no access at TOA → 50% penalty
 router.post('/:id/no-access', validateUser, async (req, res) => {
   try {
+    const { dateIndex } = req.body || {};
     const service = await CleaningService.findById(req.params.id);
     if (!service) return res.status(404).json({ message: 'Service not found' });
 
@@ -949,10 +1174,26 @@ router.post('/:id/no-access', validateUser, async (req, res) => {
 
     const base = (service.quotedAmount || service.serviceFee || 0);
     const penalty = Math.max(0, Math.round(base * POLICY.NO_ACCESS_CLIENT_PENALTY_PCT));
+    const resolved = _getOccurrence(service, typeof dateIndex === 'number' ? dateIndex : 0);
+    if (!resolved) {
+      return res.status(422).json({ message: 'Invalid or missing dateIndex' });
+    }
 
-    await CleaningService.findByIdAndUpdate(service._id, {
-      $set: { serviceStatus: 'no_access', noAccess: { at: new Date(), penalty } }
-    });
+    if (service.isRecurring && service.requestedDates?.length > 1) {
+      resolved.occurrence.status = 'no_access';
+      resolved.occurrence.noAccess = { at: new Date(), penalty };
+      _removeOccurrenceFromService(service, resolved.dateIndex);
+
+      if (service.requestedDates.length === 0) {
+        service.serviceStatus = 'no_access';
+      }
+
+      await service.save();
+    } else {
+      await CleaningService.findByIdAndUpdate(service._id, {
+        $set: { serviceStatus: 'no_access', noAccess: { at: new Date(), penalty } }
+      });
+    }
 
     if (service.requestingUserID) {
       await User.findByIdAndUpdate(service.requestingUserID, {
@@ -969,7 +1210,7 @@ router.post('/:id/no-access', validateUser, async (req, res) => {
       });
     }
 
-    return res.status(200).json({ message: 'No access recorded', penaltyApplied: penalty });
+    return res.status(200).json({ message: 'No access recorded', penaltyApplied: penalty, dateIndex: resolved.dateIndex });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ message: 'Failed to record no-access', error: err.message });

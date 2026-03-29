@@ -2,6 +2,83 @@ const mongoose = require('mongoose');
 const validator = require('validator');
 const crypto = require('crypto');
 
+const cloneChecklist = (checklist = []) =>
+  checklist.map(item => ({
+    task: item.task,
+    completedCleaner: false,
+    completedRequester: false
+  }));
+
+const buildChecklistFromService = (serviceData = {}) => {
+  const tasks = [];
+  const serviceType = String(serviceData.serviceType || '').toLowerCase();
+  const extras = Array.isArray(serviceData.extras) ? serviceData.extras : [];
+
+  const addTask = (task) => {
+    if (!task) return;
+    if (!tasks.find(existing => existing.task === task)) {
+      tasks.push({
+        task,
+        completedCleaner: false,
+        completedRequester: false
+      });
+    }
+  };
+
+  if (serviceType === 'commercial' || serviceType === 'office') {
+    addTask('Clean and sanitize work areas, desks, and shared surfaces');
+    addTask('Sweep, vacuum, and mop office floors');
+    addTask('Clean restrooms and restock essentials if provided');
+    addTask('Empty bins and remove trash');
+  } else if (serviceType === 'deep-cleaning') {
+    addTask('Sweep, vacuum, and mop all floors');
+    addTask('Dust and wipe all reachable surfaces');
+    addTask('Deep clean kitchen surfaces, sink, and exterior appliances');
+    addTask('Deep clean bathrooms including toilet, sink, bath, and shower');
+    addTask('Tidy bedrooms and living areas');
+  } else if (serviceType === 'move-in/move-out') {
+    addTask('Clean all floors, skirting, and reachable corners');
+    addTask('Wipe cupboards, shelves, and built-in storage');
+    addTask('Clean kitchen surfaces, sink, and appliance exteriors');
+    addTask('Clean bathrooms including toilet, sink, bath, and shower');
+    addTask('Remove leftover dirt, dust, and trash from the property');
+  } else if (serviceType === 'post-construction') {
+    addTask('Remove post-construction dust from surfaces and fixtures');
+    addTask('Sweep, vacuum, and mop all floors');
+    addTask('Clean windows, frames, and reachable glass surfaces');
+    addTask('Clean bathrooms and sanitize high-touch areas');
+    addTask('Dispose of light construction debris and trash');
+  } else if (serviceType === 'window') {
+    addTask('Clean interior windows and remove visible marks');
+    addTask('Wipe window sills and frames');
+  } else if (serviceType === 'carpet') {
+    addTask('Vacuum carpeted areas thoroughly');
+    addTask('Spot clean visible carpet stains where possible');
+  } else {
+    addTask('Sweep, vacuum, and mop all floors');
+    addTask('Dust and wipe surfaces in living areas and bedrooms');
+    addTask('Clean bathrooms including toilet, sink, bath, and shower');
+    addTask('Clean kitchen surfaces, sink, and outside of appliances');
+    addTask('Tidy rooms and remove trash');
+  }
+
+  extras.forEach(extra => {
+    const name = String(extra?.name || '').toLowerCase();
+
+    if (name.includes('laundry')) addTask('Wash and sort laundry items');
+    if (name.includes('clothesline') || name.includes('tumble')) addTask('Dry laundry using clothesline or tumble dryer');
+    if (name.includes('iron') || name.includes('fold')) addTask('Iron and fold clothes');
+    if (name.includes('fridge')) addTask('Clean inside the fridge and return items neatly');
+    if (name.includes('cabinet')) addTask('Clean inside cabinets and wipe shelves');
+    if (name.includes('window')) addTask('Clean interior windows and wipe frames');
+    if (name.includes('wall')) addTask('Remove visible marks and dust from interior walls');
+    if (name.includes('oven')) addTask('Clean inside the oven, trays, and racks');
+    if (name.includes('garage')) addTask('Sweep and tidy the garage area');
+  });
+
+  return tasks;
+};
+
 const cleaningServiceSchema = new mongoose.Schema({
   propertyID: {
     type: mongoose.Schema.Types.ObjectId,
@@ -170,6 +247,16 @@ const cleaningServiceSchema = new mongoose.Schema({
     },
     completedAt: Date
   }],
+  checklistsByDate: {
+    type: mongoose.Schema.Types.Mixed,
+    default: undefined
+  },
+  cleanerMarkedComplete: {
+    type: Boolean,
+    default: false
+  },
+  cleanerCompletedAt: Date,
+  requesterConfirmedAt: Date,
 
   // Cancellation
   cancellationPolicy: {
@@ -223,8 +310,24 @@ const cleaningServiceSchema = new mongoose.Schema({
 
     status: {
     type: String,
-    enum: ['scheduled', 'cancelled_by_cleaner', 'cancelled_by_user', 'completed'],
+    enum: ['scheduled', 'cancelled_by_cleaner', 'cancelled_by_user', 'completed', 'awaiting_reassignment', 'in_progress', 'no_access'],
     default: 'scheduled'
+    },
+    arrivalStatus: {
+      type: String,
+      enum: ['not_arrived', 'awaiting_code', 'code_confirmed'],
+      default: 'not_arrived'
+    },
+    arrivalVerification: {
+      codeHash: { type: String },
+      salt: { type: String },
+      generatedAt: { type: Date },
+      expiresAt: { type: Date },
+      attempts: { type: Number, default: 0 },
+      maxAttempts: { type: Number, default: 5 },
+      currentCode: { type: String },
+      verifiedAt: { type: Date },
+      verifiedByCleaner: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
     },
     cancellation: {
       by: {
@@ -243,6 +346,21 @@ const cleaningServiceSchema = new mongoose.Schema({
     type: Boolean,
     default: false
   },
+  recurringSeriesId: {
+    type: String,
+    index: true
+  },
+  recurringSeriesLabel: {
+    type: String
+  },
+  recurringOccurrenceIndex: {
+    type: Number,
+    default: 0
+  },
+  recurringOccurrenceCount: {
+    type: Number,
+    default: 1
+  },
 
   discountAmount: {
     type: Number,
@@ -254,7 +372,7 @@ const cleaningServiceSchema = new mongoose.Schema({
   chatEnabled: {
     type: Boolean,
     default: function() {
-      return this.serviceStatus === 'confirmed';
+      return this.serviceStatus === 'assigned' || this.serviceStatus === 'in_progress';
     }
   },
   lastMessage: {
@@ -263,7 +381,17 @@ const cleaningServiceSchema = new mongoose.Schema({
   },
   serviceStatus: {
     type: String,
-    enum: ['pending','assigned','in_progress','completed','cancelled','expired'],
+    enum: [
+      'pending',
+      'assigned',
+      'in_progress',
+      'completed',
+      'cancelled',
+      'expired',
+      'awaiting_reassignment',
+      'cancelled_by_client',
+      'no_access'
+    ],
     default: 'pending'
   },
   unreadCounts: [{
@@ -285,6 +413,7 @@ const cleaningServiceSchema = new mongoose.Schema({
     expiresAt: { type: Date },
     attempts: { type: Number, default: 0 },
     maxAttempts: { type: Number, default: 5 },
+    currentCode: { type: String },
     verifiedAt: { type: Date },
     verifiedByCleaner: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
   }
@@ -318,14 +447,16 @@ cleaningServiceSchema.index({ 'arrivalVerification.expiresAt': 1 });
 // Pre-save discount & checklist/payment bootstrapping
 cleaningServiceSchema.pre('save', function(next) {
   const isRecurringBooking = this.bookingFrequency && this.bookingFrequency !== 'once-off';
-  this.isRecurring = isRecurringBooking; // Sync
+  const isRecurringSeriesOccurrence = Boolean(this.recurringSeriesId && (this.recurringOccurrenceCount || 0) > 1);
+  this.isRecurring = isRecurringBooking; // Sync for multi-date legacy bookings only
 
   const base = this.baseFee || 0;
   const extrasTotal = (this.extras || []).reduce((sum, extra) => sum + (extra.fee || 0), 0);
   const totalBeforeDiscount = base + extrasTotal;
+  const shouldApplyRecurringDiscount = isRecurringBooking || isRecurringSeriesOccurrence;
 
   // Apply discount
-  if (isRecurringBooking) {
+  if (shouldApplyRecurringDiscount) {
     this.discountAmount = totalBeforeDiscount * 0.1; // 10%
   } else {
     this.discountAmount = 0;
@@ -335,12 +466,19 @@ cleaningServiceSchema.pre('save', function(next) {
   this.serviceFee = totalAfterDiscount;
 
   // Auto checklist
-  if (this.isModified('extras') && (!this.checklist || this.checklist.length === 0)) {
-    this.checklist = (this.extras || []).map(extra => ({
-      task: extra.name,
-      completedCleaner: false,
-      completedRequester: false
-    }));
+  if (!this.checklist || this.checklist.length === 0) {
+    this.checklist = buildChecklistFromService(this);
+  }
+
+  if ((!this.checklistsByDate || Object.keys(this.checklistsByDate).length === 0) && Array.isArray(this.requestedDates) && this.requestedDates.length > 1) {
+    const baseChecklist = cloneChecklist(this.checklist);
+    const checklistsByDate = {};
+
+    this.requestedDates.forEach((_, index) => {
+      checklistsByDate[index] = cloneChecklist(baseChecklist);
+    });
+
+    this.checklistsByDate = checklistsByDate;
   }
 
   // Initialize payments if empty
@@ -377,30 +515,46 @@ cleaningServiceSchema.virtual('arrivalVerified').get(function () {
 const ARRIVAL_DEFAULT_TTL_MIN = 2;
 const ARRIVAL_MAX_ATTEMPTS = 5;
 
-cleaningServiceSchema.methods.generateArrivalCode = function (ttlMinutes = ARRIVAL_DEFAULT_TTL_MIN) {
+const resolveArrivalTarget = (service, dateIndex) => {
+  if (service.isRecurring && Array.isArray(service.requestedDates) && service.requestedDates.length > 1) {
+    if (typeof dateIndex !== 'number' || !service.requestedDates[dateIndex]) {
+      throw new Error('A valid dateIndex is required for recurring services.');
+    }
+
+    return service.requestedDates[dateIndex];
+  }
+
+  return service;
+};
+
+cleaningServiceSchema.methods.generateArrivalCode = function (ttlMinutes = ARRIVAL_DEFAULT_TTL_MIN, dateIndex) {
   const code = String(Math.floor(Math.random() * 1_000_000)).padStart(6, '0'); // 6 digits
   const salt = crypto.randomBytes(16).toString('hex');
   const codeHash = crypto.createHash('sha256').update(salt + code).digest('hex');
+  const target = resolveArrivalTarget(this, dateIndex);
 
   const now = new Date();
   const expires = new Date(now.getTime() + (ttlMinutes * 60 * 1000));
 
-  this.arrivalVerification = {
+  target.arrivalVerification = {
     codeHash,
     salt,
     generatedAt: now,
     expiresAt: expires,
     attempts: 0,
     maxAttempts: ARRIVAL_MAX_ATTEMPTS,
+    currentCode: code,
     verifiedAt: null,
     verifiedByCleaner: null
   };
+  target.arrivalStatus = 'awaiting_code';
 
   return code; // plaintext for display/send only
 };
 
-cleaningServiceSchema.methods.verifyArrivalCode = async function (submittedCode, cleanerId) {
-  const v = this.arrivalVerification || {};
+cleaningServiceSchema.methods.verifyArrivalCode = async function (submittedCode, cleanerId, dateIndex) {
+  const target = resolveArrivalTarget(this, dateIndex);
+  const v = target.arrivalVerification || {};
   const now = new Date();
 
   if (!v.codeHash || !v.salt || !v.expiresAt) {
@@ -423,8 +577,9 @@ cleaningServiceSchema.methods.verifyArrivalCode = async function (submittedCode,
     crypto.timingSafeEqual(Buffer.from(candidate, 'hex'), Buffer.from(v.codeHash, 'hex'));
 
   if (ok) {
-    this.arrivalVerification.verifiedAt = now;
-    this.arrivalVerification.verifiedByCleaner = cleanerId || null;
+    target.arrivalVerification.verifiedAt = now;
+    target.arrivalVerification.verifiedByCleaner = cleanerId || null;
+    target.arrivalStatus = 'code_confirmed';
 
     if (this.serviceStatus === 'assigned') {
       this.serviceStatus = 'in_progress';
@@ -435,9 +590,9 @@ cleaningServiceSchema.methods.verifyArrivalCode = async function (submittedCode,
     return { ok: true, verified: true };
   }
 
-  this.arrivalVerification.attempts = (v.attempts || 0) + 1;
+  target.arrivalVerification.attempts = (v.attempts || 0) + 1;
   await this.save();
-  const remaining = (this.arrivalVerification.maxAttempts || ARRIVAL_MAX_ATTEMPTS) - this.arrivalVerification.attempts;
+  const remaining = (target.arrivalVerification.maxAttempts || ARRIVAL_MAX_ATTEMPTS) - target.arrivalVerification.attempts;
   throw new Error(remaining > 0 ? `Invalid code. ${remaining} attempt(s) left.` : 'Too many attempts. Code locked.');
 };
 
