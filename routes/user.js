@@ -267,6 +267,57 @@ const notifyAdminDecision = async (userId, updateFields, currentUser) => {
   }
 };
 
+const hasValueChanged = (incomingValue, existingValue) => {
+  if (incomingValue === undefined) {
+    return false;
+  }
+
+  if (Array.isArray(incomingValue) || Array.isArray(existingValue)) {
+    const incoming = Array.isArray(incomingValue) ? incomingValue : [];
+    const existing = Array.isArray(existingValue) ? existingValue : [];
+
+    return JSON.stringify(incoming) !== JSON.stringify(existing);
+  }
+
+  return String(incomingValue) !== String(existingValue ?? '');
+};
+
+const cleanerUpdatedFlaggedFields = (existingUser, updateFields) => {
+  const declineReasons = Array.isArray(existingUser.declineReasons) ? existingUser.declineReasons : [];
+
+  if (declineReasons.length === 0) {
+    return false;
+  }
+
+  const personalInfoFields = [
+    'name',
+    'surname',
+    'email',
+    'phoneNumber',
+    'physicalAddress',
+    'gender',
+    'dateOfBirth',
+    'idNumber',
+    'expertise',
+  ];
+
+  return declineReasons.some((reason) => {
+    switch (reason) {
+      case 'personalInfo':
+        return personalInfoFields.some((field) => hasValueChanged(updateFields[field], existingUser[field]));
+      case 'profileImage':
+      case 'idDocument':
+      case 'proofOfResidence':
+      case 'policeClearance':
+        return hasValueChanged(updateFields[reason], existingUser[reason]);
+      case 'cvOrSupportingDocs':
+        return hasValueChanged(updateFields.cvOrSupportingDocs, existingUser.cvOrSupportingDocs);
+      default:
+        return false;
+    }
+  });
+};
+
 router.put('/:id/profile', cpUpload, async (req, res) => {
   try {
 
@@ -280,12 +331,28 @@ router.put('/:id/profile', cpUpload, async (req, res) => {
     }
 
     const updateFields = { ...req.body };
+    const existingUser = await User.findById(userId);
+
+    if (!existingUser) {
+      return res.status(404).json({ error: 'User not found' });
+    }
 
     const fileUrls = await processUploads(req.files || {}, 'users');
 
     normalizeUploadedFiles(updateFields, fileUrls);
 
     await handlePasswordUpdate(updateFields, userId);
+
+    const cleanerResubmittedApplication = existingUser.role === 'cleaner'
+      && Array.isArray(existingUser.declineReasons)
+      && existingUser.declineReasons.length > 0
+      && cleanerUpdatedFlaggedFields(existingUser, updateFields);
+
+    if (cleanerResubmittedApplication) {
+      updateFields.accountStatus = 'registering';
+      updateFields.declineReasons = [];
+      updateFields.adminNotes = '';
+    }
 
     const updatedUser = await updateUserRecord(userId, updateFields);
 
@@ -294,6 +361,16 @@ router.put('/:id/profile', cpUpload, async (req, res) => {
     }
 
     await notifyProfileUpdate(userId, currentUser);
+
+    if (cleanerResubmittedApplication) {
+      await addNotification(
+        userId,
+        'Application Resubmitted',
+        'Your updated application has been sent back for admin review.',
+        'info',
+        '/profile'
+      );
+    }
 
     res.json(updatedUser);
 
